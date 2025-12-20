@@ -1,0 +1,62 @@
+일단 이제 화면 잘나온다
+
+
+확인했습니다. 이제 “UI가 잘 뜨는 상태”가 확보됐으니, 다음은 PoC의 품질을 한 단계 올리기 위해 입력 경험(typing UX) 과 정확도 지표의 신뢰성을 우선 정리하는 게 효율적입니다.
+
+아래는 제가 권하는 “즉시 가치가 큰” 다음 작업 후보들입니다. (질문으로 되묻지 않고, 바로 적용 가능한 방향으로 정리했습니다.)
+
+1) 오타 처리 UX: “오타가 나면 어떻게 할 것인가” 정책 확정
+
+현재는 오타를 표시만 하고 계속 입력이 가능합니다. 타이핑 트레이너 관점에서는 보통 2가지 모드가 유용합니다.
+
+Strict 모드(추천): 첫 오타 위치 이후 입력을 허용하지 않음
+
+효과: “정답을 맞춰가며 타이핑” 훈련에 최적
+
+구현: textChanged에서 첫 mismatch index 이후 텍스트를 자동 롤백(커서도 mismatch로 이동)
+
+Free 모드(현행): 오타가 있어도 계속 입력 가능
+
+효과: “속도 우선” 또는 “전체 문장 완주”에 유리
+
+UI로는 상단에 Mode: Strict/Free 콤보 하나 두면 끝납니다.
+
+2) 진행률/커서 정의 개선
+
+현재 progress는 “정확한 prefix 길이” 기반인데, Strict 모드에서는 매우 자연스럽습니다.
+Free 모드에서는 아래가 더 직관적일 수 있습니다.
+
+Progress = typed_len / total_len (완주율)
+
+별도로 Correct prefix 또는 Correct ratio를 제공
+
+즉, Progress와 Accuracy를 혼동하지 않게 지표를 분리하면 사용성이 좋아집니다.
+
+3) 타이핑 메트릭 고도화: Net WPM vs Raw WPM
+
+현재 WPM은 “net correct chars 기반”인데 좋은 선택입니다. 추가로 아래를 같이 보여주면 사용자 입장에서 납득이 더 잘 됩니다.
+
+Raw WPM: typed chars 기준
+
+Net WPM: (typed - errors) 기준
+
+Error Rate: errors / typed
+
+4) Source ↔ Input 동기 스크롤 개선
+
+지금은 source가 커서 주변으로 따라오도록 했는데, 실사용에서는 다음이 체감이 큽니다.
+
+Input 커서 이동 시 Source도 같은 라인으로 스크롤
+
+Splitter 비율 저장(마지막 비율 기억)
+
+5) 세션 결과 저장(이력)
+
+PoC를 “툴”로 만들려면 기록이 중요합니다.
+
+results.csv 또는 results.jsonl에
+
+timestamp, target_name, elapsed, raw_wpm, net_wpm, accuracy, errors, total_chars
+
+원하시면 제가 v0.1.2로 바로 반영해서 “전체 코드” 형태로 드리겠습니다.
+가장 먼저 적용할 1순위를 제가 임의로 정하자면, Strict/Free 모드 토글 + Strict에서 오타 이후 입력 자동 차단이 가장 체감이 큽니다.
