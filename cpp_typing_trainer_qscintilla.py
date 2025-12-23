@@ -2,17 +2,16 @@
 """
 C++ Typing Trainer (PyQt5 + QScintilla)
 
-Version: 0.1.3  (2025-12-24)
+Version: 0.1.4  (2025-12-24)
 Versioning: MAJOR.MINOR.PATCH (SemVer)
 - MAJOR: 호환성 깨지는 변경
 - MINOR: 기능 추가(호환 유지)
 - PATCH: 버그 수정/리팩토링 등 소규모 개선
 
-Release Notes (v0.1.3):
-- (New) 좌측 Presets 패널 추가: 자주 연습하는 코드 목록 상시 표시 + 클릭 적용
-- (New) Preset Add/Rename/Delete 기능 추가 (AppData/presets.json 영구 저장)
-- (Maintain) Load .txt 기능 유지 (프리셋과 별개로 즉시 로드/연습 가능)
-- (Maintain) Strict Mode, Beep on Error, overlay, paste-block, metrics 안정화 유지
+Release Notes (v0.1.4):
+- (New) Preset 순서 변경 기능 추가: Up/Down + Drag&Drop 재정렬, 저장 영구 반영
+- (New) Preset Import/Export 추가: JSON 내보내기/가져오기(Replace/Merge)
+- (Maintain) Presets 패널/CRUD, Load .txt, Strict Mode, Beep on Error, overlay, paste-block, metrics 유지
 """
 
 import sys
@@ -40,9 +39,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QInputDialog,
     QAbstractItemView,
-    QFrame,
 )
-
 
 from PyQt5.Qsci import QsciScintilla, QsciLexerCPP
 
@@ -87,9 +84,10 @@ def _safe_write_text(path: str, text: str, retries: int = 8, backoff_s: float = 
     tmp -> replace를 재시도(backoff) 합니다.
     """
     folder = os.path.dirname(path)
-    _ensure_dir(folder)
+    if folder:
+        _ensure_dir(folder)
 
-    tmp_fd, tmp_path = tempfile.mkstemp(prefix="._tmp_", suffix=".tmp", dir=folder)
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="._tmp_", suffix=".tmp", dir=(folder if folder else None))
     os.close(tmp_fd)
 
     try:
@@ -106,7 +104,6 @@ def _safe_write_text(path: str, text: str, retries: int = 8, backoff_s: float = 
                 time.sleep(backoff_s * (i + 1))
         raise last_err if last_err else PermissionError("os.replace failed")
     finally:
-        # if still exists, try cleanup
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -116,6 +113,15 @@ def _safe_write_text(path: str, text: str, retries: int = 8, backoff_s: float = 
 
 def _safe_write_json(path: str, data: dict):
     _safe_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _read_text_with_fallback(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except UnicodeDecodeError:
+        with open(path, "r", encoding="cp949", errors="replace") as f:
+            return f.read()
 
 
 # ---------------- Preset Store ----------------
@@ -144,8 +150,10 @@ class PresetStore:
         }
         self.load()
 
+    # ----- core IO -----
     def load(self):
         if not os.path.exists(self.path):
+            self._normalize()
             self.save()
             return
         try:
@@ -153,13 +161,15 @@ class PresetStore:
                 d = json.load(f)
             if isinstance(d, dict) and "presets" in d:
                 self.data = d
-                # minimal validation
-                if not isinstance(self.data.get("presets"), list) or len(self.data["presets"]) == 0:
-                    self.data["presets"] = [{"name": "Default", "text": DEFAULT_CPP}]
-                if "last_selected" not in self.data:
-                    self.data["last_selected"] = None
+            else:
+                # tolerate legacy formats
+                self.data = {
+                    "version": 1,
+                    "presets": self._coerce_presets(d),
+                    "last_selected": None,
+                }
+            self._normalize()
         except Exception:
-            # fallback to default if file is corrupted
             self.data = {
                 "version": 1,
                 "presets": [{"name": "Default", "text": DEFAULT_CPP}],
@@ -168,8 +178,91 @@ class PresetStore:
             self.save()
 
     def save(self):
+        self._normalize()
         _safe_write_json(self.path, self.data)
 
+    def export_to(self, out_path: str):
+        self._normalize()
+        _safe_write_json(out_path, self.data)
+
+    def import_from(self, in_path: str):
+        raw = _read_text_with_fallback(in_path)
+        obj = json.loads(raw)
+        # Accept:
+        # 1) dict with "presets"
+        # 2) list of presets
+        if isinstance(obj, dict) and "presets" in obj:
+            presets = self._coerce_presets(obj.get("presets"))
+            last = obj.get("last_selected")
+            return {
+                "version": 1,
+                "presets": presets,
+                "last_selected": last if isinstance(last, str) else None,
+            }
+        # fallback: list
+        presets = self._coerce_presets(obj)
+        return {"version": 1, "presets": presets, "last_selected": None}
+
+    # ----- normalization & validation -----
+    def _coerce_presets(self, maybe) -> list:
+        presets = []
+        if isinstance(maybe, list):
+            for it in maybe:
+                if isinstance(it, dict) and "name" in it:
+                    name = str(it.get("name", "")).strip()
+                    text = str(it.get("text", ""))
+                    if name:
+                        presets.append({"name": name, "text": text})
+                elif isinstance(it, str):
+                    # If list of strings, create numbered names
+                    presets.append({"name": it[:24] if it.strip() else "Preset", "text": it})
+        elif isinstance(maybe, dict):
+            # {name: text} 형태도 허용
+            for k, v in maybe.items():
+                name = str(k).strip()
+                if name:
+                    presets.append({"name": name, "text": str(v)})
+        return presets
+
+    def _normalize(self):
+        # Ensure structure
+        if not isinstance(self.data, dict):
+            self.data = {"version": 1, "presets": [{"name": "Default", "text": DEFAULT_CPP}], "last_selected": "Default"}
+
+        if "presets" not in self.data or not isinstance(self.data["presets"], list):
+            self.data["presets"] = []
+
+        # Remove invalids, enforce unique names
+        cleaned = []
+        seen = set()
+        for p in self.data["presets"]:
+            if not isinstance(p, dict):
+                continue
+            name = str(p.get("name", "")).strip()
+            text = str(p.get("text", ""))
+            if not name:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            cleaned.append({"name": name, "text": text})
+
+        # Always ensure at least Default exists
+        if not any(p["name"] == "Default" for p in cleaned):
+            cleaned.insert(0, {"name": "Default", "text": DEFAULT_CPP})
+
+        self.data["presets"] = cleaned
+        if "version" not in self.data:
+            self.data["version"] = 1
+        if "last_selected" not in self.data:
+            self.data["last_selected"] = "Default"
+
+        # last_selected must exist; else fallback
+        last = self.data.get("last_selected")
+        if not isinstance(last, str) or last not in {p["name"] for p in cleaned}:
+            self.data["last_selected"] = cleaned[0]["name"] if cleaned else "Default"
+
+    # ----- accessors -----
     def list_names(self):
         return [p.get("name", "") for p in self.data.get("presets", [])]
 
@@ -179,6 +272,7 @@ class PresetStore:
                 return p
         return None
 
+    # ----- mutations -----
     def upsert(self, name: str, text: str):
         name = (name or "").strip()
         if not name:
@@ -214,14 +308,60 @@ class PresetStore:
         kept = [p for p in presets if p.get("name") != name]
         if len(kept) == len(presets):
             return False
-        self.data["presets"] = kept if kept else [{"name": "Default", "text": DEFAULT_CPP}]
-        if self.data.get("last_selected") == name:
-            self.data["last_selected"] = self.data["presets"][0]["name"]
+        self.data["presets"] = kept
+        self._normalize()
         self.save()
         return True
 
     def set_last_selected(self, name: str | None):
+        if name is None:
+            return
         self.data["last_selected"] = name
+        self.save()
+
+    def reorder_by_names(self, ordered_names: list[str]):
+        # Keep only known names, preserve order; append any missing
+        name_to_p = {p["name"]: p for p in self.data.get("presets", [])}
+        new_list = []
+        used = set()
+        for n in ordered_names:
+            if n in name_to_p and n not in used:
+                new_list.append(name_to_p[n])
+                used.add(n)
+        for p in self.data.get("presets", []):
+            if p["name"] not in used:
+                new_list.append(p)
+        self.data["presets"] = new_list
+        self._normalize()
+        self.save()
+
+    def merge_in(self, imported_data: dict):
+        # Merge presets; name conflicts get suffix
+        imp_presets = imported_data.get("presets", [])
+        for p in imp_presets:
+            name = str(p.get("name", "")).strip()
+            text = str(p.get("text", ""))
+            if not name:
+                continue
+
+            final = name
+            if self.get_by_name(final) is not None:
+                base = final
+                idx = 2
+                while self.get_by_name(final) is not None:
+                    final = f"{base} ({idx})"
+                    idx += 1
+            self.upsert(final, text)
+
+        # Keep current last_selected if still valid; else imported last if exists
+        imp_last = imported_data.get("last_selected")
+        if isinstance(imp_last, str) and self.get_by_name(imp_last):
+            self.set_last_selected(imp_last)
+
+    def replace_with(self, imported_data: dict):
+        presets = imported_data.get("presets", [])
+        self.data = {"version": 1, "presets": presets, "last_selected": imported_data.get("last_selected")}
+        self._normalize()
         self.save()
 
 
@@ -256,7 +396,6 @@ class TypingEditor(QsciScintilla):
         self._host._set_cursor_to_end(self, text)
 
     def keyPressEvent(self, event):
-        # Block paste (Ctrl+V, Shift+Insert)
         if event.matches(QKeySequence.Paste):
             QMessageBox.information(self, "Paste blocked", "Paste is blocked for typing practice.")
             return
@@ -287,7 +426,6 @@ class TypingEditor(QsciScintilla):
 
 
 class MainWindow(QMainWindow):
-    # Indicator IDs
     IND_CORRECT = 0
     IND_WRONG = 1
     IND_CURSOR = 2
@@ -295,7 +433,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("C++ Typing Trainer (PyQt5 + QScintilla)")
-        self.resize(1200, 760)
+        self.resize(1280, 780)
 
         self.settings = QSettings("PoC_Algo_Typer", "CppTypingTrainer")
         self.pstore = PresetStore()
@@ -307,26 +445,27 @@ class MainWindow(QMainWindow):
         self.running = False
         self._ignore_textchange = False
         self._prev_first_mismatch = None
+        self._suppress_preset_apply = False  # used when reordering list
 
         self.timer = QTimer(self)
         self.timer.setInterval(100)
         self.timer.timeout.connect(self._on_tick)
 
         self._build_ui()
+        self._restore_ui_settings()
+        self._refresh_preset_list(select_name=self.pstore.data.get("last_selected"))
 
-        # load last selected preset if exists
+        # apply last-selected preset on startup
         last = self.pstore.data.get("last_selected")
-        if last and self.pstore.get_by_name(last):
-            p = self.pstore.get_by_name(last)
+        p = self.pstore.get_by_name(last) if last else None
+        if p:
             self._apply_target(p.get("text", ""), name=p.get("name", "Preset"), from_preset=True)
-            self._select_preset_in_list(last)
+            self._select_preset_in_list(p.get("name"))
         else:
-            self._apply_target(self.target_text, name=self.target_name, from_preset=True)
+            self._apply_target(DEFAULT_CPP, name="Default", from_preset=True)
             self._select_preset_in_list("Default")
 
         self._reset()
-        self._restore_ui_settings()
-        self._refresh_preset_list(select_name=self.pstore.data.get("last_selected"))
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -337,7 +476,6 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(10)
 
-        # Top controls
         top = QHBoxLayout()
         outer.addLayout(top)
 
@@ -353,7 +491,6 @@ class MainWindow(QMainWindow):
         self.btn_default.clicked.connect(self._use_default_preset)
         self.btn_start.clicked.connect(self._start)
         self.btn_reset.clicked.connect(self._reset)
-
         self.chk_strict.toggled.connect(self._on_option_changed)
         self.chk_beep.toggled.connect(self._on_option_changed)
 
@@ -366,12 +503,10 @@ class MainWindow(QMainWindow):
         top.addWidget(self.btn_start)
         top.addWidget(self.btn_reset)
 
-        # Target label
         self.lbl_target = QLabel("Target: (not loaded)")
         self.lbl_target.setTextInteractionFlags(Qt.TextSelectableByMouse)
         outer.addWidget(self.lbl_target)
 
-        # Metrics row
         met = QHBoxLayout()
         outer.addLayout(met)
 
@@ -387,13 +522,11 @@ class MainWindow(QMainWindow):
             met.addWidget(w)
         met.addStretch(1)
 
-        # Main horizontal splitter: [Presets] | [Editors]
         self.main_splitter = QSplitter(Qt.Horizontal)
         outer.addWidget(self.main_splitter, stretch=1)
 
-        # Left presets panel
+        # Left: Presets panel
         self.preset_panel = QWidget()
-        self.preset_panel.setMinimumWidth(240)
         pvl = QVBoxLayout(self.preset_panel)
         pvl.setContentsMargins(8, 8, 8, 8)
         pvl.setSpacing(8)
@@ -404,52 +537,78 @@ class MainWindow(QMainWindow):
 
         self.list_presets = QListWidget()
         self.list_presets.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        # Drag&Drop reorder
+        self.list_presets.setDragEnabled(True)
+        self.list_presets.setAcceptDrops(True)
+        self.list_presets.setDropIndicatorShown(True)
+        self.list_presets.setDragDropMode(QAbstractItemView.InternalMove)
+
         self.list_presets.itemSelectionChanged.connect(self._on_preset_selected)
         pvl.addWidget(self.list_presets, stretch=1)
 
-        pb = QHBoxLayout()
+        # Reorder buttons
+        rb = QHBoxLayout()
+        self.btn_p_up = QPushButton("Up")
+        self.btn_p_down = QPushButton("Down")
+        self.btn_p_up.clicked.connect(self._preset_move_up)
+        self.btn_p_down.clicked.connect(self._preset_move_down)
+        rb.addWidget(self.btn_p_up)
+        rb.addWidget(self.btn_p_down)
+        pvl.addLayout(rb)
+
+        # CRUD buttons
+        cb = QHBoxLayout()
         self.btn_p_add = QPushButton("Add")
         self.btn_p_rename = QPushButton("Rename")
         self.btn_p_del = QPushButton("Delete")
-
         self.btn_p_add.clicked.connect(self._preset_add_current)
         self.btn_p_rename.clicked.connect(self._preset_rename)
         self.btn_p_del.clicked.connect(self._preset_delete)
+        cb.addWidget(self.btn_p_add)
+        cb.addWidget(self.btn_p_rename)
+        cb.addWidget(self.btn_p_del)
+        pvl.addLayout(cb)
 
-        pb.addWidget(self.btn_p_add)
-        pb.addWidget(self.btn_p_rename)
-        pb.addWidget(self.btn_p_del)
-        pvl.addLayout(pb)
+        # Import/Export
+        ib = QHBoxLayout()
+        self.btn_p_import = QPushButton("Import")
+        self.btn_p_export = QPushButton("Export")
+        self.btn_p_import.clicked.connect(self._preset_import)
+        self.btn_p_export.clicked.connect(self._preset_export)
+        ib.addWidget(self.btn_p_import)
+        ib.addWidget(self.btn_p_export)
+        pvl.addLayout(ib)
 
-        hint = QLabel("Tip: Load .txt 후 Add로 Preset 저장 가능")
+        hint = QLabel("Tip: Load .txt 후 Add로 Preset 저장 가능\nTip: Preset은 드래그로 순서 변경 가능")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #555;")
         pvl.addWidget(hint)
 
-        # A separator look (optional)
-        self.preset_panel.setFrameStyle(QFrame.StyledPanel) if isinstance(self.preset_panel, QFrame) else None
-
         self.main_splitter.addWidget(self.preset_panel)
 
-        # Editors splitter (source/input)
+        # Right: Editors splitter
         self.editor_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.addWidget(self.editor_splitter)
-        self.main_splitter.setSizes([260, 940])
+        self.main_splitter.setSizes([280, 1000])
 
-        # Source editor (read-only)
         self.src = QsciScintilla()
         self._setup_editor(self.src, readonly=True)
         self.editor_splitter.addWidget(self.src)
 
-        # Input editor
         self.inp = TypingEditor(host=self)
         self._setup_editor(self.inp, readonly=False)
         self.editor_splitter.addWidget(self.inp)
 
         self.editor_splitter.setSizes([560, 540])
 
-        # Signals
         self.inp.textChanged.connect(self._on_input_changed)
+
+        # rowsMoved hook to persist drag-drop reorder
+        try:
+            self.list_presets.model().rowsMoved.connect(self._on_preset_rows_moved)
+        except Exception:
+            pass
 
     def _setup_editor(self, ed: QsciScintilla, readonly: bool):
         font = QFont("Consolas", 11)
@@ -522,7 +681,9 @@ class MainWindow(QMainWindow):
         if select_name:
             self._select_preset_in_list(select_name)
 
-    def _select_preset_in_list(self, name: str):
+    def _select_preset_in_list(self, name: str | None):
+        if not name:
+            return
         for i in range(self.list_presets.count()):
             if self.list_presets.item(i).text() == name:
                 self.list_presets.setCurrentRow(i)
@@ -534,7 +695,20 @@ class MainWindow(QMainWindow):
             return None
         return items[0].text()
 
+    def _sync_store_order_from_list(self):
+        names = [self.list_presets.item(i).text() for i in range(self.list_presets.count())]
+        self.pstore.reorder_by_names(names)
+
+    def _on_preset_rows_moved(self, *args):
+        # Drag&Drop reorder completed
+        cur = self._current_preset_name()
+        self._sync_store_order_from_list()
+        if cur:
+            self._select_preset_in_list(cur)
+
     def _on_preset_selected(self):
+        if self._suppress_preset_apply:
+            return
         name = self._current_preset_name()
         if not name:
             return
@@ -544,8 +718,33 @@ class MainWindow(QMainWindow):
         self.pstore.set_last_selected(name)
         self._apply_target(p.get("text", ""), name=name, from_preset=True)
 
+    def _preset_move_up(self):
+        row = self.list_presets.currentRow()
+        if row <= 0:
+            return
+        self._suppress_preset_apply = True
+        try:
+            item = self.list_presets.takeItem(row)
+            self.list_presets.insertItem(row - 1, item)
+            self.list_presets.setCurrentRow(row - 1)
+            self._sync_store_order_from_list()
+        finally:
+            self._suppress_preset_apply = False
+
+    def _preset_move_down(self):
+        row = self.list_presets.currentRow()
+        if row < 0 or row >= self.list_presets.count() - 1:
+            return
+        self._suppress_preset_apply = True
+        try:
+            item = self.list_presets.takeItem(row)
+            self.list_presets.insertItem(row + 1, item)
+            self.list_presets.setCurrentRow(row + 1)
+            self._sync_store_order_from_list()
+        finally:
+            self._suppress_preset_apply = False
+
     def _preset_add_current(self):
-        # Add current target (source) as preset
         default_name = self.target_name if self.target_name else "NewPreset"
         name, ok = QInputDialog.getText(self, "Add Preset", "Preset name:", text=default_name)
         if not ok:
@@ -554,7 +753,6 @@ class MainWindow(QMainWindow):
         if not name:
             return
 
-        # Avoid duplicate: auto-suffix
         base = name
         idx = 2
         while self.pstore.get_by_name(name) is not None:
@@ -580,27 +778,87 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Rename failed", "Name already exists or invalid.")
             return
         self._refresh_preset_list(select_name=new)
-        # If the current target was that preset, update label context too
         if self.target_name == old:
             self.target_name = new
-            self.lbl_target.setText(f"Target: {self.target_name}  |  {len(self.target_text)} chars")
+            self.lbl_target.setText(f"Target: {self.target_name} (Preset)  |  {len(self.target_text)} chars")
 
     def _preset_delete(self):
         name = self._current_preset_name()
         if not name:
             QMessageBox.information(self, "Delete", "Select a preset to delete.")
             return
-        if name == "Default":
-            # allow delete but confirm stronger
-            msg = "Delete 'Default' preset? (A Default will be recreated if none remain.)"
-        else:
-            msg = f"Delete preset '{name}'?"
+        msg = "Delete 'Default' preset? (Default will be recreated if none remain.)" if name == "Default" else f"Delete preset '{name}'?"
         if QMessageBox.question(self, "Confirm delete", msg) != QMessageBox.Yes:
             return
-
         self.pstore.delete(name)
-        select = self.pstore.data.get("last_selected") or (self.pstore.list_names()[0] if self.pstore.list_names() else None)
+        select = self.pstore.data.get("last_selected")
         self._refresh_preset_list(select_name=select)
+        # apply selected
+        if select:
+            p = self.pstore.get_by_name(select)
+            if p:
+                self._apply_target(p.get("text", ""), name=select, from_preset=True)
+
+    def _preset_export(self):
+        default_name = "presets_export.json"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Presets",
+            default_name,
+            "JSON Files (*.json);;All Files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            self.pstore.export_to(path)
+            QMessageBox.information(self, "Export", f"Exported presets to:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", f"Failed to export:\n{e}")
+
+    def _preset_import(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Presets",
+            "",
+            "JSON Files (*.json);;All Files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            imported = self.pstore.import_from(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import failed", f"Failed to read JSON:\n{e}")
+            return
+
+        # Ask replace vs merge
+        r = QMessageBox.question(
+            self,
+            "Import mode",
+            "Replace existing presets?\n\nYes: Replace (overwrite all)\nNo: Merge (keep existing, add imported)",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.No,
+        )
+        if r == QMessageBox.Cancel:
+            return
+
+        try:
+            if r == QMessageBox.Yes:
+                self.pstore.replace_with(imported)
+            else:
+                self.pstore.merge_in(imported)
+        except Exception as e:
+            QMessageBox.critical(self, "Import failed", f"Failed to import:\n{e}")
+            return
+
+        # Refresh list & apply last
+        last = self.pstore.data.get("last_selected")
+        self._refresh_preset_list(select_name=last)
+        if last:
+            p = self.pstore.get_by_name(last)
+            if p:
+                self._apply_target(p.get("text", ""), name=last, from_preset=True)
+
+        QMessageBox.information(self, "Import", "Import completed.")
 
     def _use_default_preset(self):
         self._select_preset_in_list("Default")
@@ -640,7 +898,6 @@ class MainWindow(QMainWindow):
         self._update_metrics(Metrics(total=len(self.target_text)))
         self._clear_indicators(self.src, len(self.target_text))
         self._clear_indicators(self.inp, 0)
-
         self._update_overlay_src(typed_text="")
         self._update_overlay_inp(typed_text="")
 
@@ -666,17 +923,12 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
-        except UnicodeDecodeError:
-            with open(path, "r", encoding="cp949", errors="replace") as f:
-                text = f.read()
+            text = _read_text_with_fallback(path)
         except Exception as e:
             QMessageBox.critical(self, "Load failed", f"Failed to load file:\n{e}")
             return
 
         name = os.path.basename(path)
-        # Load는 프리셋 선택과 별개이므로 selection 해제(시각적으로도 "임시 로드" 느낌)
         self.list_presets.clearSelection()
         self._apply_target(text, name=name, from_preset=False)
 
@@ -687,11 +939,9 @@ class MainWindow(QMainWindow):
 
         typed = (self.inp.text() or "").replace("\r\n", "\n")
 
-        # Auto-start when user begins typing
         if (not self.running) and typed:
             self._start()
 
-        # Strict mode enforcement
         if self.is_strict_mode():
             new_typed = self._enforce_strict_typed(typed)
             if new_typed != typed:
@@ -851,10 +1101,7 @@ class MainWindow(QMainWindow):
                 j = i + 1
                 while j < plen and (typed_text[j] == target[j]) == is_ok:
                     j += 1
-                if is_ok:
-                    self._fill_indicator(self.src, self.IND_CORRECT, i, j - i)
-                else:
-                    self._fill_indicator(self.src, self.IND_WRONG, i, j - i)
+                self._fill_indicator(self.src, self.IND_CORRECT if is_ok else self.IND_WRONG, i, j - i)
                 i = j
 
         correct_prefix = 0
@@ -886,10 +1133,7 @@ class MainWindow(QMainWindow):
                 j = i + 1
                 while j < plen and (typed_text[j] == target[j]) == is_ok:
                     j += 1
-                if is_ok:
-                    self._fill_indicator(self.inp, self.IND_CORRECT, i, j - i)
-                else:
-                    self._fill_indicator(self.inp, self.IND_WRONG, i, j - i)
+                self._fill_indicator(self.inp, self.IND_CORRECT if is_ok else self.IND_WRONG, i, j - i)
                 i = j
 
         if ilen > tlen:
@@ -903,11 +1147,7 @@ class MainWindow(QMainWindow):
         if fm is None and ilen > tlen:
             fm = tlen
 
-        if fm is None:
-            cursor_pos = max(0, ilen - 1)
-        else:
-            cursor_pos = max(0, min(fm, ilen - 1))
-
+        cursor_pos = max(0, (min(fm, ilen - 1) if fm is not None else ilen - 1))
         self._fill_indicator(self.inp, self.IND_CURSOR, cursor_pos, 1)
 
     # ---------------- Utilities ----------------
