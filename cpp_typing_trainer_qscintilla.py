@@ -2,16 +2,15 @@
 """
 C++ Typing Trainer (PyQt5 + QScintilla)
 
-Version: 0.1.4  (2025-12-24)
+Version: 0.1.5  (2025-12-24)
 Versioning: MAJOR.MINOR.PATCH (SemVer)
-- MAJOR: 호환성 깨지는 변경
-- MINOR: 기능 추가(호환 유지)
-- PATCH: 버그 수정/리팩토링 등 소규모 개선
 
-Release Notes (v0.1.4):
-- (New) Preset 순서 변경 기능 추가: Up/Down + Drag&Drop 재정렬, 저장 영구 반영
-- (New) Preset Import/Export 추가: JSON 내보내기/가져오기(Replace/Merge)
-- (Maintain) Presets 패널/CRUD, Load .txt, Strict Mode, Beep on Error, overlay, paste-block, metrics 유지
+Release Notes (v0.1.5):
+- (New) Dark Theme 지원 (Light/Dark 전환 + 설정 유지)
+  - Qt 전역 팔레트(Fusion) + QScintilla/lexer 색상 동기화
+  - margin, caret line, selection, indicator 색상까지 적용
+- (Maintain) Preset reorder(Up/Down + Drag&Drop), Import/Export(Replace/Merge), Load .txt,
+            Strict Mode, Beep, overlay, paste-block, metrics 유지
 """
 
 import sys
@@ -22,7 +21,7 @@ import tempfile
 from dataclasses import dataclass
 
 from PyQt5.QtCore import Qt, QTimer, QSettings, QStandardPaths
-from PyQt5.QtGui import QFont, QKeySequence
+from PyQt5.QtGui import QFont, QKeySequence, QColor, QPalette
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -39,6 +38,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QInputDialog,
     QAbstractItemView,
+    QComboBox,
 )
 
 from PyQt5.Qsci import QsciScintilla, QsciLexerCPP
@@ -79,10 +79,6 @@ def _ensure_dir(path: str):
 
 
 def _safe_write_text(path: str, text: str, retries: int = 8, backoff_s: float = 0.08):
-    """
-    Windows에서 파일 lock/백신 스캔 등으로 os.replace가 간헐적으로 실패할 수 있어
-    tmp -> replace를 재시도(backoff) 합니다.
-    """
     folder = os.path.dirname(path)
     if folder:
         _ensure_dir(folder)
@@ -150,7 +146,6 @@ class PresetStore:
         }
         self.load()
 
-    # ----- core IO -----
     def load(self):
         if not os.path.exists(self.path):
             self._normalize()
@@ -162,19 +157,10 @@ class PresetStore:
             if isinstance(d, dict) and "presets" in d:
                 self.data = d
             else:
-                # tolerate legacy formats
-                self.data = {
-                    "version": 1,
-                    "presets": self._coerce_presets(d),
-                    "last_selected": None,
-                }
+                self.data = {"version": 1, "presets": self._coerce_presets(d), "last_selected": None}
             self._normalize()
         except Exception:
-            self.data = {
-                "version": 1,
-                "presets": [{"name": "Default", "text": DEFAULT_CPP}],
-                "last_selected": "Default",
-            }
+            self.data = {"version": 1, "presets": [{"name": "Default", "text": DEFAULT_CPP}], "last_selected": "Default"}
             self.save()
 
     def save(self):
@@ -188,22 +174,13 @@ class PresetStore:
     def import_from(self, in_path: str):
         raw = _read_text_with_fallback(in_path)
         obj = json.loads(raw)
-        # Accept:
-        # 1) dict with "presets"
-        # 2) list of presets
         if isinstance(obj, dict) and "presets" in obj:
             presets = self._coerce_presets(obj.get("presets"))
             last = obj.get("last_selected")
-            return {
-                "version": 1,
-                "presets": presets,
-                "last_selected": last if isinstance(last, str) else None,
-            }
-        # fallback: list
+            return {"version": 1, "presets": presets, "last_selected": last if isinstance(last, str) else None}
         presets = self._coerce_presets(obj)
         return {"version": 1, "presets": presets, "last_selected": None}
 
-    # ----- normalization & validation -----
     def _coerce_presets(self, maybe) -> list:
         presets = []
         if isinstance(maybe, list):
@@ -214,10 +191,8 @@ class PresetStore:
                     if name:
                         presets.append({"name": name, "text": text})
                 elif isinstance(it, str):
-                    # If list of strings, create numbered names
                     presets.append({"name": it[:24] if it.strip() else "Preset", "text": it})
         elif isinstance(maybe, dict):
-            # {name: text} 형태도 허용
             for k, v in maybe.items():
                 name = str(k).strip()
                 if name:
@@ -225,14 +200,12 @@ class PresetStore:
         return presets
 
     def _normalize(self):
-        # Ensure structure
         if not isinstance(self.data, dict):
             self.data = {"version": 1, "presets": [{"name": "Default", "text": DEFAULT_CPP}], "last_selected": "Default"}
 
         if "presets" not in self.data or not isinstance(self.data["presets"], list):
             self.data["presets"] = []
 
-        # Remove invalids, enforce unique names
         cleaned = []
         seen = set()
         for p in self.data["presets"]:
@@ -247,22 +220,17 @@ class PresetStore:
             seen.add(name)
             cleaned.append({"name": name, "text": text})
 
-        # Always ensure at least Default exists
         if not any(p["name"] == "Default" for p in cleaned):
             cleaned.insert(0, {"name": "Default", "text": DEFAULT_CPP})
 
         self.data["presets"] = cleaned
-        if "version" not in self.data:
-            self.data["version"] = 1
-        if "last_selected" not in self.data:
-            self.data["last_selected"] = "Default"
+        self.data.setdefault("version", 1)
+        self.data.setdefault("last_selected", "Default")
 
-        # last_selected must exist; else fallback
         last = self.data.get("last_selected")
         if not isinstance(last, str) or last not in {p["name"] for p in cleaned}:
             self.data["last_selected"] = cleaned[0]["name"] if cleaned else "Default"
 
-    # ----- accessors -----
     def list_names(self):
         return [p.get("name", "") for p in self.data.get("presets", [])]
 
@@ -272,7 +240,6 @@ class PresetStore:
                 return p
         return None
 
-    # ----- mutations -----
     def upsert(self, name: str, text: str):
         name = (name or "").strip()
         if not name:
@@ -320,7 +287,6 @@ class PresetStore:
         self.save()
 
     def reorder_by_names(self, ordered_names: list[str]):
-        # Keep only known names, preserve order; append any missing
         name_to_p = {p["name"]: p for p in self.data.get("presets", [])}
         new_list = []
         used = set()
@@ -336,14 +302,12 @@ class PresetStore:
         self.save()
 
     def merge_in(self, imported_data: dict):
-        # Merge presets; name conflicts get suffix
         imp_presets = imported_data.get("presets", [])
         for p in imp_presets:
             name = str(p.get("name", "")).strip()
             text = str(p.get("text", ""))
             if not name:
                 continue
-
             final = name
             if self.get_by_name(final) is not None:
                 base = final
@@ -353,7 +317,6 @@ class PresetStore:
                     idx += 1
             self.upsert(final, text)
 
-        # Keep current last_selected if still valid; else imported last if exists
         imp_last = imported_data.get("last_selected")
         if isinstance(imp_last, str) and self.get_by_name(imp_last):
             self.set_last_selected(imp_last)
@@ -373,15 +336,10 @@ class Metrics:
     errors: int = 0
     typed: int = 0
     total: int = 0
-    progress: float = 0.0  # 0~100
+    progress: float = 0.0
 
 
 class TypingEditor(QsciScintilla):
-    """
-    Typing practice editor:
-    - Blocks paste to preserve practice integrity.
-    - In strict mode, blocks cursor navigation and forces cursor to end.
-    """
     def __init__(self, host=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._host = host
@@ -445,7 +403,7 @@ class MainWindow(QMainWindow):
         self.running = False
         self._ignore_textchange = False
         self._prev_first_mismatch = None
-        self._suppress_preset_apply = False  # used when reordering list
+        self._suppress_preset_apply = False
 
         self.timer = QTimer(self)
         self.timer.setInterval(100)
@@ -453,9 +411,12 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._restore_ui_settings()
+
+        # Apply theme after UI built (affects palette + editors)
+        self._apply_theme(self._get_theme())
+
         self._refresh_preset_list(select_name=self.pstore.data.get("last_selected"))
 
-        # apply last-selected preset on startup
         last = self.pstore.data.get("last_selected")
         p = self.pstore.get_by_name(last) if last else None
         if p:
@@ -487,6 +448,11 @@ class MainWindow(QMainWindow):
         self.chk_strict = QCheckBox("Strict Mode")
         self.chk_beep = QCheckBox("Beep on Error")
 
+        # Theme selector
+        self.cmb_theme = QComboBox()
+        self.cmb_theme.addItems(["Light", "Dark"])
+        self.cmb_theme.currentTextChanged.connect(self._on_theme_changed)
+
         self.btn_load.clicked.connect(self._load_txt)
         self.btn_default.clicked.connect(self._use_default_preset)
         self.btn_start.clicked.connect(self._start)
@@ -499,6 +465,9 @@ class MainWindow(QMainWindow):
         top.addSpacing(12)
         top.addWidget(self.chk_strict)
         top.addWidget(self.chk_beep)
+        top.addSpacing(12)
+        top.addWidget(QLabel("Theme:"))
+        top.addWidget(self.cmb_theme)
         top.addStretch(1)
         top.addWidget(self.btn_start)
         top.addWidget(self.btn_reset)
@@ -525,7 +494,7 @@ class MainWindow(QMainWindow):
         self.main_splitter = QSplitter(Qt.Horizontal)
         outer.addWidget(self.main_splitter, stretch=1)
 
-        # Left: Presets panel
+        # Left: Presets
         self.preset_panel = QWidget()
         pvl = QVBoxLayout(self.preset_panel)
         pvl.setContentsMargins(8, 8, 8, 8)
@@ -538,7 +507,6 @@ class MainWindow(QMainWindow):
         self.list_presets = QListWidget()
         self.list_presets.setSelectionMode(QAbstractItemView.SingleSelection)
 
-        # Drag&Drop reorder
         self.list_presets.setDragEnabled(True)
         self.list_presets.setAcceptDrops(True)
         self.list_presets.setDropIndicatorShown(True)
@@ -547,7 +515,6 @@ class MainWindow(QMainWindow):
         self.list_presets.itemSelectionChanged.connect(self._on_preset_selected)
         pvl.addWidget(self.list_presets, stretch=1)
 
-        # Reorder buttons
         rb = QHBoxLayout()
         self.btn_p_up = QPushButton("Up")
         self.btn_p_down = QPushButton("Down")
@@ -557,7 +524,6 @@ class MainWindow(QMainWindow):
         rb.addWidget(self.btn_p_down)
         pvl.addLayout(rb)
 
-        # CRUD buttons
         cb = QHBoxLayout()
         self.btn_p_add = QPushButton("Add")
         self.btn_p_rename = QPushButton("Rename")
@@ -570,7 +536,6 @@ class MainWindow(QMainWindow):
         cb.addWidget(self.btn_p_del)
         pvl.addLayout(cb)
 
-        # Import/Export
         ib = QHBoxLayout()
         self.btn_p_import = QPushButton("Import")
         self.btn_p_export = QPushButton("Export")
@@ -580,14 +545,9 @@ class MainWindow(QMainWindow):
         ib.addWidget(self.btn_p_export)
         pvl.addLayout(ib)
 
-        hint = QLabel("Tip: Load .txt 후 Add로 Preset 저장 가능\nTip: Preset은 드래그로 순서 변경 가능")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #555;")
-        pvl.addWidget(hint)
-
         self.main_splitter.addWidget(self.preset_panel)
 
-        # Right: Editors splitter
+        # Right: editors
         self.editor_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.addWidget(self.editor_splitter)
         self.main_splitter.setSizes([280, 1000])
@@ -599,12 +559,11 @@ class MainWindow(QMainWindow):
         self.inp = TypingEditor(host=self)
         self._setup_editor(self.inp, readonly=False)
         self.editor_splitter.addWidget(self.inp)
-
         self.editor_splitter.setSizes([560, 540])
 
         self.inp.textChanged.connect(self._on_input_changed)
 
-        # rowsMoved hook to persist drag-drop reorder
+        # Persist drag-drop reorder
         try:
             self.list_presets.model().rowsMoved.connect(self._on_preset_rows_moved)
         except Exception:
@@ -618,8 +577,6 @@ class MainWindow(QMainWindow):
 
         ed.setMarginType(0, QsciScintilla.NumberMargin)
         ed.setMarginWidth(0, "00000")
-        ed.setMarginsForegroundColor(Qt.darkGray)
-        ed.setMarginsBackgroundColor(Qt.lightGray)
 
         ed.setIndentationsUseTabs(False)
         ed.setTabWidth(4)
@@ -645,6 +602,136 @@ class MainWindow(QMainWindow):
         ed.indicatorDefine(QsciScintilla.INDIC_SQUIGGLE, self.IND_WRONG)
         ed.indicatorDefine(QsciScintilla.INDIC_FULLBOX, self.IND_CURSOR)
 
+    # ---------------- Theme ----------------
+    def _get_theme(self) -> str:
+        t = self.settings.value("theme", "Light")
+        return t if t in ("Light", "Dark") else "Light"
+
+    def _save_theme(self, theme: str):
+        self.settings.setValue("theme", theme)
+
+    def _on_theme_changed(self, theme: str):
+        theme = theme if theme in ("Light", "Dark") else "Light"
+        self._save_theme(theme)
+        self._apply_theme(theme)
+
+    def _apply_theme(self, theme: str):
+        # Keep combobox in sync (avoid recursion)
+        if self.cmb_theme.currentText() != theme:
+            self.cmb_theme.blockSignals(True)
+            try:
+                self.cmb_theme.setCurrentText(theme)
+            finally:
+                self.cmb_theme.blockSignals(False)
+
+        app = QApplication.instance()
+        if not app:
+            return
+
+        # Use Fusion for consistent palette behavior
+        try:
+            app.setStyle("Fusion")
+        except Exception:
+            pass
+
+        if theme == "Dark":
+            pal = QPalette()
+            pal.setColor(QPalette.Window, QColor(30, 30, 30))
+            pal.setColor(QPalette.WindowText, QColor(220, 220, 220))
+            pal.setColor(QPalette.Base, QColor(25, 25, 25))
+            pal.setColor(QPalette.AlternateBase, QColor(35, 35, 35))
+            pal.setColor(QPalette.ToolTipBase, QColor(255, 255, 255))
+            pal.setColor(QPalette.ToolTipText, QColor(0, 0, 0))
+            pal.setColor(QPalette.Text, QColor(220, 220, 220))
+            pal.setColor(QPalette.Button, QColor(45, 45, 45))
+            pal.setColor(QPalette.ButtonText, QColor(220, 220, 220))
+            pal.setColor(QPalette.Highlight, QColor(70, 110, 160))
+            pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+            app.setPalette(pal)
+
+            self._apply_scintilla_theme(
+                paper=QColor(25, 25, 25),
+                ink=QColor(220, 220, 220),
+                margin_bg=QColor(45, 45, 45),
+                margin_fg=QColor(180, 180, 180),
+                caretline_bg=QColor(40, 40, 40),
+                selection_bg=QColor(70, 110, 160),
+                selection_fg=QColor(255, 255, 255),
+                indic_correct=QColor(0, 200, 0),
+                indic_wrong=QColor(255, 90, 90),
+                indic_cursor=QColor(90, 160, 255),
+            )
+        else:
+            app.setPalette(app.style().standardPalette())
+            self._apply_scintilla_theme(
+                paper=QColor(255, 255, 255),
+                ink=QColor(0, 0, 0),
+                margin_bg=QColor(235, 235, 235),
+                margin_fg=QColor(80, 80, 80),
+                caretline_bg=QColor(245, 245, 245),
+                selection_bg=QColor(180, 210, 240),
+                selection_fg=QColor(0, 0, 0),
+                indic_correct=QColor(0, 140, 0),
+                indic_wrong=QColor(220, 60, 60),
+                indic_cursor=QColor(60, 120, 220),
+            )
+
+    def _apply_scintilla_theme(
+        self,
+        paper: QColor,
+        ink: QColor,
+        margin_bg: QColor,
+        margin_fg: QColor,
+        caretline_bg: QColor,
+        selection_bg: QColor,
+        selection_fg: QColor,
+        indic_correct: QColor,
+        indic_wrong: QColor,
+        indic_cursor: QColor,
+    ):
+        for ed in (getattr(self, "src", None), getattr(self, "inp", None)):
+            if ed is None:
+                continue
+
+            # Editor base colors
+            ed.setPaper(paper)
+            ed.setColor(ink)
+            ed.setCaretLineBackgroundColor(caretline_bg)
+
+            # Margin
+            ed.setMarginsBackgroundColor(margin_bg)
+            ed.setMarginsForegroundColor(margin_fg)
+
+            # Selection
+            ed.setSelectionBackgroundColor(selection_bg)
+            ed.setSelectionForegroundColor(selection_fg)
+
+            # Indicators: improve visibility on dark background
+            try:
+                ed.indicatorSetForegroundColor(indic_correct, self.IND_CORRECT)
+                ed.indicatorSetForegroundColor(indic_wrong, self.IND_WRONG)
+                ed.indicatorSetForegroundColor(indic_cursor, self.IND_CURSOR)
+            except Exception:
+                pass
+
+            # Lexer colors (apply to many styles to avoid mixed defaults)
+            lex = ed.lexer()
+            if lex is not None:
+                try:
+                    lex.setDefaultPaper(paper)
+                    lex.setDefaultColor(ink)
+                    for style in range(0, 128):
+                        lex.setPaper(paper, style)
+                        lex.setColor(ink, style)
+                except Exception:
+                    pass
+
+            # Force redraw
+            try:
+                ed.repaint()
+            except Exception:
+                pass
+
     # ---------------- Options ----------------
     def is_strict_mode(self) -> bool:
         return self.chk_strict.isChecked()
@@ -665,8 +752,10 @@ class MainWindow(QMainWindow):
     def _restore_ui_settings(self):
         strict = self.settings.value("strict_mode", False, type=bool)
         beep = self.settings.value("beep_on_error", True, type=bool)
+        theme = self._get_theme()
         self.chk_strict.setChecked(strict)
         self.chk_beep.setChecked(beep)
+        self.cmb_theme.setCurrentText(theme)
 
     # ---------------- Presets UI ----------------
     def _refresh_preset_list(self, select_name: str | None = None):
@@ -700,7 +789,6 @@ class MainWindow(QMainWindow):
         self.pstore.reorder_by_names(names)
 
     def _on_preset_rows_moved(self, *args):
-        # Drag&Drop reorder completed
         cur = self._current_preset_name()
         self._sync_store_order_from_list()
         if cur:
@@ -793,20 +881,13 @@ class MainWindow(QMainWindow):
         self.pstore.delete(name)
         select = self.pstore.data.get("last_selected")
         self._refresh_preset_list(select_name=select)
-        # apply selected
         if select:
             p = self.pstore.get_by_name(select)
             if p:
                 self._apply_target(p.get("text", ""), name=select, from_preset=True)
 
     def _preset_export(self):
-        default_name = "presets_export.json"
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Presets",
-            default_name,
-            "JSON Files (*.json);;All Files (*.*)",
-        )
+        path, _ = QFileDialog.getSaveFileName(self, "Export Presets", "presets_export.json", "JSON Files (*.json);;All Files (*.*)")
         if not path:
             return
         try:
@@ -816,12 +897,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export failed", f"Failed to export:\n{e}")
 
     def _preset_import(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Import Presets",
-            "",
-            "JSON Files (*.json);;All Files (*.*)",
-        )
+        path, _ = QFileDialog.getOpenFileName(self, "Import Presets", "", "JSON Files (*.json);;All Files (*.*)")
         if not path:
             return
         try:
@@ -830,7 +906,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Import failed", f"Failed to read JSON:\n{e}")
             return
 
-        # Ask replace vs merge
         r = QMessageBox.question(
             self,
             "Import mode",
@@ -850,7 +925,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Import failed", f"Failed to import:\n{e}")
             return
 
-        # Refresh list & apply last
         last = self.pstore.data.get("last_selected")
         self._refresh_preset_list(select_name=last)
         if last:
@@ -914,12 +988,7 @@ class MainWindow(QMainWindow):
         self.inp.setFocus()
 
     def _load_txt(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Load target text",
-            "",
-            "Text Files (*.txt);;All Files (*.*)",
-        )
+        path, _ = QFileDialog.getOpenFileName(self, "Load target text", "", "Text Files (*.txt);;All Files (*.*)")
         if not path:
             return
         try:
@@ -989,10 +1058,7 @@ class MainWindow(QMainWindow):
                 QApplication.beep()
         self._prev_first_mismatch = first_mismatch
 
-        if typed_len == 0:
-            accuracy = 100.0
-        else:
-            accuracy = max(0.0, (typed_len - mismatches) / typed_len * 100.0)
+        accuracy = 100.0 if typed_len == 0 else max(0.0, (typed_len - mismatches) / typed_len * 100.0)
 
         correct_prefix = 0
         for i in range(min(typed_len, total)):
@@ -1003,20 +1069,9 @@ class MainWindow(QMainWindow):
         progress = 0.0 if total == 0 else (correct_prefix / total * 100.0)
 
         net_correct = max(0, typed_len - mismatches)
-        if elapsed > 0.0:
-            wpm = (net_correct / 5.0) / (elapsed / 60.0)
-        else:
-            wpm = 0.0
+        wpm = (net_correct / 5.0) / (elapsed / 60.0) if elapsed > 0.0 else 0.0
 
-        m = Metrics(
-            elapsed_s=elapsed,
-            wpm=wpm,
-            accuracy=accuracy,
-            errors=mismatches,
-            typed=typed_len,
-            total=total,
-            progress=progress,
-        )
+        m = Metrics(elapsed_s=elapsed, wpm=wpm, accuracy=accuracy, errors=mismatches, typed=typed_len, total=total, progress=progress)
         self._update_metrics(m)
 
         pos = min(correct_prefix, max(0, total))
