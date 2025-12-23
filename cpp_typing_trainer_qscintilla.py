@@ -2,16 +2,19 @@
 """
 C++ Typing Trainer (PyQt5 + QScintilla)
 
-Version: 0.1.7  (2025-12-24)
+Version: 0.1.9  (2025-12-24)
 Versioning: MAJOR.MINOR.PATCH (SemVer)
 
-Release Notes (v0.1.7):
-- (Fix) QsciLexerCPP 에 setFontWeight()가 없어 발생한 AttributeError 해결
-  - 스타일별 QFont 복제 + lex.setFont(font, style) 방식으로 bold/italic 적용
-- (Improve) Dark 테마에서 IDE 느낌의 C++ 컬러링(VS Code Dark+ 근사) 유지
-- (Maintain) Presets(좌측 목록/선택/추가/삭제/이름변경/Up/Down/Drag reorder),
-            Import/Export(Replace/Merge), Load .txt, Strict Mode, Beep, overlay,
-            paste-block, metrics, auto-start 유지
+Release Notes (v0.1.9):
+- (Fix) Marker symbol 상수(ShortArrow/RightArrow 등) 미존재 환경에서의 AttributeError 해결
+  - markerDefine 시 사용 가능한 심볼을 hasattr()로 탐색하여 자동 fallback (방법 B)
+- (Maintain) v0.1.8의 IDE 감성 기능 유지
+  - Bracket matching 색상/굵기 커스터마이즈
+  - 기대 위치(=expected) 라인 강조 (Source caret line + marker)
+  - 첫 mismatch 라인 gutter marker (Source/Input)
+  - Dark/Light 테마 + C++ 컬러링
+  - Presets 관리(좌측 목록/추가/삭제/이름변경/정렬/드래그), Import/Export, Load .txt,
+    Strict Mode, Beep, overlay, paste-block, metrics, auto-start
 """
 
 import sys
@@ -20,6 +23,7 @@ import json
 import time
 import tempfile
 from dataclasses import dataclass
+from typing import Optional, List
 
 from PyQt5.QtCore import Qt, QTimer, QSettings, QStandardPaths
 from PyQt5.QtGui import QFont, QKeySequence, QColor, QPalette
@@ -172,7 +176,7 @@ class PresetStore:
         self._normalize()
         _safe_write_json(out_path, self.data)
 
-    def import_from(self, in_path: str):
+    def import_from(self, in_path: str) -> dict:
         raw = _read_text_with_fallback(in_path)
         obj = json.loads(raw)
         if isinstance(obj, dict) and "presets" in obj:
@@ -232,7 +236,7 @@ class PresetStore:
         if not isinstance(last, str) or last not in {p["name"] for p in cleaned}:
             self.data["last_selected"] = cleaned[0]["name"] if cleaned else "Default"
 
-    def list_names(self):
+    def list_names(self) -> List[str]:
         return [p.get("name", "") for p in self.data.get("presets", [])]
 
     def get_by_name(self, name: str):
@@ -241,7 +245,7 @@ class PresetStore:
                 return p
         return None
 
-    def upsert(self, name: str, text: str):
+    def upsert(self, name: str, text: str) -> bool:
         name = (name or "").strip()
         if not name:
             return False
@@ -254,7 +258,7 @@ class PresetStore:
         self.save()
         return True
 
-    def rename(self, old: str, new: str):
+    def rename(self, old: str, new: str) -> bool:
         new = (new or "").strip()
         if not new:
             return False
@@ -271,7 +275,7 @@ class PresetStore:
         self.save()
         return True
 
-    def delete(self, name: str):
+    def delete(self, name: str) -> bool:
         presets = self.data.get("presets", [])
         kept = [p for p in presets if p.get("name") != name]
         if len(kept) == len(presets):
@@ -281,13 +285,13 @@ class PresetStore:
         self.save()
         return True
 
-    def set_last_selected(self, name: str | None):
+    def set_last_selected(self, name: Optional[str]):
         if name is None:
             return
         self.data["last_selected"] = name
         self.save()
 
-    def reorder_by_names(self, ordered_names: list[str]):
+    def reorder_by_names(self, ordered_names: List[str]):
         name_to_p = {p["name"]: p for p in self.data.get("presets", [])}
         new_list = []
         used = set()
@@ -385,9 +389,23 @@ class TypingEditor(QsciScintilla):
 
 
 class MainWindow(QMainWindow):
+    # Indicators (overlay)
     IND_CORRECT = 0
     IND_WRONG = 1
     IND_CURSOR = 2
+
+    # Markers (gutter)
+    MARK_EXPECT = 1
+    MARK_MISMATCH = 2
+
+    # Scintilla style constants for brace highlight
+    STYLE_BRACELIGHT = 34
+    STYLE_BRACEBAD = 35
+
+    # Scintilla message constants (stable)
+    SCI_STYLESETFORE = 2051
+    SCI_STYLESETBACK = 2052
+    SCI_STYLESETBOLD = 2053
 
     def __init__(self):
         super().__init__()
@@ -405,6 +423,9 @@ class MainWindow(QMainWindow):
         self._ignore_textchange = False
         self._prev_first_mismatch = None
         self._suppress_preset_apply = False
+
+        self._last_expected_idx = 0
+        self._last_first_mismatch_idx = None
 
         self.timer = QTimer(self)
         self.timer.setInterval(100)
@@ -564,6 +585,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    # ---------------- Marker symbol fallback (방법 B) ----------------
+    @staticmethod
+    def _pick_marker_symbol(*names: str, default: int) -> int:
+        for n in names:
+            if hasattr(QsciScintilla, n):
+                return getattr(QsciScintilla, n)
+        return default
+
     def _setup_editor(self, ed: QsciScintilla, readonly: bool):
         font = QFont("Consolas", 11)
         ed.setUtf8(True)
@@ -573,9 +602,25 @@ class MainWindow(QMainWindow):
         # store base font for lexer styling (bold/italic)
         self._base_editor_font = QFont(font)
 
+        # Margin 0: line numbers
         ed.setMarginType(0, QsciScintilla.NumberMargin)
         ed.setMarginWidth(0, "00000")
 
+        # Margin 1: symbol gutter (IDE-like)
+        ed.setMarginType(1, QsciScintilla.SymbolMargin)
+        ed.setMarginWidth(1, 14)
+        ed.setMarginSensitivity(1, False)
+        mask = (1 << self.MARK_EXPECT) | (1 << self.MARK_MISMATCH)
+        ed.setMarginMarkerMask(1, mask)
+
+        # Marker symbols with robust fallback
+        expect_sym = self._pick_marker_symbol("ShortArrow", "Circle", "SmallRect", default=QsciScintilla.Circle)
+        mismatch_sym = self._pick_marker_symbol("RightArrow", "Arrow", "Circle", default=QsciScintilla.RightArrow)
+
+        ed.markerDefine(expect_sym, self.MARK_EXPECT)
+        ed.markerDefine(mismatch_sym, self.MARK_MISMATCH)
+
+        # Indentation & braces
         ed.setIndentationsUseTabs(False)
         ed.setTabWidth(4)
         ed.setIndentationGuides(True)
@@ -585,10 +630,12 @@ class MainWindow(QMainWindow):
         ed.setBraceMatching(QsciScintilla.SloppyBraceMatch)
         ed.setCaretLineVisible(True)
 
+        # Lexer
         lexer = QsciLexerCPP(ed)
         lexer.setFont(font)
         ed.setLexer(lexer)
 
+        # Autocomplete
         ed.setAutoCompletionSource(QsciScintilla.AcsAll)
         ed.setAutoCompletionThreshold(2)
         ed.setAutoCompletionCaseSensitivity(False)
@@ -596,11 +643,12 @@ class MainWindow(QMainWindow):
 
         ed.setReadOnly(readonly)
 
+        # Indicators (overlay)
         ed.indicatorDefine(QsciScintilla.INDIC_STRAIGHTBOX, self.IND_CORRECT)
         ed.indicatorDefine(QsciScintilla.INDIC_SQUIGGLE, self.IND_WRONG)
         ed.indicatorDefine(QsciScintilla.INDIC_FULLBOX, self.IND_CURSOR)
 
-    # ---------------- Theme ----------------
+    # ---------------- Theme helpers ----------------
     def _get_theme(self) -> str:
         t = self.settings.value("theme", "Light")
         return t if t in ("Light", "Dark") else "Light"
@@ -613,14 +661,36 @@ class MainWindow(QMainWindow):
         self._save_theme(theme)
         self._apply_theme(theme)
 
+    @staticmethod
+    def _rgb_scintilla(c: QColor) -> int:
+        # Scintilla COLORREF: 0x00BBGGRR
+        return (c.red() & 0xFF) | ((c.green() & 0xFF) << 8) | ((c.blue() & 0xFF) << 16)
+
+    def _apply_brace_style(
+        self,
+        ed: QsciScintilla,
+        br_light_fg: QColor,
+        br_light_bg: QColor,
+        br_bad_fg: QColor,
+        br_bad_bg: QColor,
+        bold: bool,
+    ):
+        ed.SendScintilla(self.SCI_STYLESETFORE, self.STYLE_BRACELIGHT, self._rgb_scintilla(br_light_fg))
+        ed.SendScintilla(self.SCI_STYLESETBACK, self.STYLE_BRACELIGHT, self._rgb_scintilla(br_light_bg))
+        ed.SendScintilla(self.SCI_STYLESETBOLD, self.STYLE_BRACELIGHT, 1 if bold else 0)
+
+        ed.SendScintilla(self.SCI_STYLESETFORE, self.STYLE_BRACEBAD, self._rgb_scintilla(br_bad_fg))
+        ed.SendScintilla(self.SCI_STYLESETBACK, self.STYLE_BRACEBAD, self._rgb_scintilla(br_bad_bg))
+        ed.SendScintilla(self.SCI_STYLESETBOLD, self.STYLE_BRACEBAD, 1 if bold else 0)
+
     def _set_lex_style(
         self,
         lex: QsciLexerCPP,
         style: int,
-        fg: QColor | None = None,
-        bg: QColor | None = None,
-        bold: bool | None = None,
-        italic: bool | None = None,
+        fg: Optional[QColor] = None,
+        bg: Optional[QColor] = None,
+        bold: Optional[bool] = None,
+        italic: Optional[bool] = None,
     ):
         if fg is not None:
             lex.setColor(fg, style)
@@ -650,15 +720,15 @@ class MainWindow(QMainWindow):
         lex.setDefaultColor(ink)
 
         if theme == "Dark":
-            c_comment = QColor(106, 153, 85)      # #6A9955
-            c_keyword = QColor(86, 156, 214)      # #569CD6
-            c_keyword2 = QColor(197, 134, 192)    # #C586C0
-            c_string = QColor(206, 145, 120)      # #CE9178
-            c_number = QColor(181, 206, 168)      # #B5CEA8
+            c_comment = QColor(106, 153, 85)
+            c_keyword = QColor(86, 156, 214)
+            c_keyword2 = QColor(197, 134, 192)
+            c_string = QColor(206, 145, 120)
+            c_number = QColor(181, 206, 168)
             c_preproc = QColor(155, 155, 155)
             c_identifier = ink
-            c_class = QColor(78, 201, 176)        # #4EC9B0
-            c_regex = QColor(215, 186, 125)       # #D7BA7D
+            c_class = QColor(78, 201, 176)
+            c_regex = QColor(215, 186, 125)
             c_bad = QColor(255, 100, 100)
             c_doc_kw = QColor(86, 156, 214)
         else:
@@ -675,7 +745,6 @@ class MainWindow(QMainWindow):
             c_doc_kw = QColor(0, 0, 180)
 
         S = QsciLexerCPP
-
         self._set_lex_style(lex, S.Default, fg=ink, bold=False)
         self._set_lex_style(lex, S.Identifier, fg=c_identifier)
         self._set_lex_style(lex, S.Operator, fg=ink)
@@ -748,12 +817,19 @@ class MainWindow(QMainWindow):
                 ink=QColor(212, 212, 212),
                 margin_bg=QColor(45, 45, 45),
                 margin_fg=QColor(180, 180, 180),
-                caretline_bg=QColor(40, 40, 40),
+                caretline_src_bg=QColor(52, 52, 52),
+                caretline_inp_bg=QColor(40, 40, 40),
                 selection_bg=QColor(70, 110, 160),
                 selection_fg=QColor(255, 255, 255),
                 indic_correct=QColor(0, 200, 0),
                 indic_wrong=QColor(255, 90, 90),
                 indic_cursor=QColor(90, 160, 255),
+                mark_expect=QColor(90, 160, 255),
+                mark_mismatch=QColor(255, 90, 90),
+                brace_light_fg=QColor(255, 255, 255),
+                brace_light_bg=QColor(90, 160, 255),
+                brace_bad_fg=QColor(255, 255, 255),
+                brace_bad_bg=QColor(255, 90, 90),
             )
         else:
             app.setPalette(app.style().standardPalette())
@@ -763,13 +839,24 @@ class MainWindow(QMainWindow):
                 ink=QColor(0, 0, 0),
                 margin_bg=QColor(235, 235, 235),
                 margin_fg=QColor(80, 80, 80),
-                caretline_bg=QColor(245, 245, 245),
+                caretline_src_bg=QColor(235, 245, 255),
+                caretline_inp_bg=QColor(245, 245, 245),
                 selection_bg=QColor(180, 210, 240),
                 selection_fg=QColor(0, 0, 0),
                 indic_correct=QColor(0, 140, 0),
                 indic_wrong=QColor(220, 60, 60),
                 indic_cursor=QColor(60, 120, 220),
+                mark_expect=QColor(60, 120, 220),
+                mark_mismatch=QColor(220, 60, 60),
+                brace_light_fg=QColor(255, 255, 255),
+                brace_light_bg=QColor(60, 120, 220),
+                brace_bad_fg=QColor(255, 255, 255),
+                brace_bad_bg=QColor(220, 60, 60),
             )
+
+        typed = (self.inp.text() or "").replace("\r\n", "\n")
+        self._update_overlay_src(typed_text=typed)
+        self._update_overlay_inp(typed_text=typed)
 
     def _apply_scintilla_theme(
         self,
@@ -778,20 +865,32 @@ class MainWindow(QMainWindow):
         ink: QColor,
         margin_bg: QColor,
         margin_fg: QColor,
-        caretline_bg: QColor,
+        caretline_src_bg: QColor,
+        caretline_inp_bg: QColor,
         selection_bg: QColor,
         selection_fg: QColor,
         indic_correct: QColor,
         indic_wrong: QColor,
         indic_cursor: QColor,
+        mark_expect: QColor,
+        mark_mismatch: QColor,
+        brace_light_fg: QColor,
+        brace_light_bg: QColor,
+        brace_bad_fg: QColor,
+        brace_bad_bg: QColor,
     ):
-        for ed in (getattr(self, "src", None), getattr(self, "inp", None)):
+        editors = [
+            (getattr(self, "src", None), caretline_src_bg),
+            (getattr(self, "inp", None), caretline_inp_bg),
+        ]
+
+        for ed, caret_bg in editors:
             if ed is None:
                 continue
 
             ed.setPaper(paper)
             ed.setColor(ink)
-            ed.setCaretLineBackgroundColor(caretline_bg)
+            ed.setCaretLineBackgroundColor(caret_bg)
 
             ed.setMarginsBackgroundColor(margin_bg)
             ed.setMarginsForegroundColor(margin_fg)
@@ -805,6 +904,23 @@ class MainWindow(QMainWindow):
                 ed.indicatorSetForegroundColor(indic_cursor, self.IND_CURSOR)
             except Exception:
                 pass
+
+            try:
+                ed.setMarkerBackgroundColor(mark_expect, self.MARK_EXPECT)
+                ed.setMarkerForegroundColor(QColor(255, 255, 255), self.MARK_EXPECT)
+                ed.setMarkerBackgroundColor(mark_mismatch, self.MARK_MISMATCH)
+                ed.setMarkerForegroundColor(QColor(255, 255, 255), self.MARK_MISMATCH)
+            except Exception:
+                pass
+
+            self._apply_brace_style(
+                ed,
+                br_light_fg=brace_light_fg,
+                br_light_bg=brace_light_bg,
+                br_bad_fg=brace_bad_fg,
+                br_bad_bg=brace_bad_bg,
+                bold=True,
+            )
 
             lex = ed.lexer()
             if isinstance(lex, QsciLexerCPP):
@@ -841,7 +957,7 @@ class MainWindow(QMainWindow):
         self.cmb_theme.setCurrentText(theme)
 
     # ---------------- Presets UI ----------------
-    def _refresh_preset_list(self, select_name: str | None = None):
+    def _refresh_preset_list(self, select_name: Optional[str] = None):
         self.list_presets.blockSignals(True)
         try:
             self.list_presets.clear()
@@ -853,7 +969,7 @@ class MainWindow(QMainWindow):
         if select_name:
             self._select_preset_in_list(select_name)
 
-    def _select_preset_in_list(self, name: str | None):
+    def _select_preset_in_list(self, name: Optional[str]):
         if not name:
             return
         for i in range(self.list_presets.count()):
@@ -861,7 +977,7 @@ class MainWindow(QMainWindow):
                 self.list_presets.setCurrentRow(i)
                 return
 
-    def _current_preset_name(self) -> str | None:
+    def _current_preset_name(self) -> Optional[str]:
         items = self.list_presets.selectedItems()
         if not items:
             return None
@@ -1045,6 +1161,8 @@ class MainWindow(QMainWindow):
         self.running = False
         self.start_time = None
         self._prev_first_mismatch = None
+        self._last_first_mismatch_idx = None
+        self._last_expected_idx = 0
 
         self._ignore_textchange = True
         try:
@@ -1055,6 +1173,9 @@ class MainWindow(QMainWindow):
         self._update_metrics(Metrics(total=len(self.target_text)))
         self._clear_indicators(self.src, len(self.target_text))
         self._clear_indicators(self.inp, 0)
+        self._clear_markers(self.src)
+        self._clear_markers(self.inp)
+
         self._update_overlay_src(typed_text="")
         self._update_overlay_inp(typed_text="")
 
@@ -1101,9 +1222,10 @@ class MainWindow(QMainWindow):
                 typed = new_typed
             self._set_cursor_to_end(self.inp, typed)
 
+        self._compute_and_update_metrics(typed)
+
         self._update_overlay_src(typed_text=typed)
         self._update_overlay_inp(typed_text=typed)
-        self._compute_and_update_metrics(typed)
 
         if typed == self.target_text and self.target_text:
             self.timer.stop()
@@ -1140,6 +1262,7 @@ class MainWindow(QMainWindow):
             if self._prev_first_mismatch is None and first_mismatch is not None:
                 QApplication.beep()
         self._prev_first_mismatch = first_mismatch
+        self._last_first_mismatch_idx = first_mismatch
 
         accuracy = 100.0 if typed_len == 0 else max(0.0, (typed_len - mismatches) / typed_len * 100.0)
 
@@ -1149,6 +1272,8 @@ class MainWindow(QMainWindow):
                 break
             correct_prefix += 1
 
+        self._last_expected_idx = min(correct_prefix, max(0, total))
+
         progress = 0.0 if total == 0 else (correct_prefix / total * 100.0)
 
         net_correct = max(0, typed_len - mismatches)
@@ -1157,7 +1282,7 @@ class MainWindow(QMainWindow):
         m = Metrics(elapsed_s=elapsed, wpm=wpm, accuracy=accuracy, errors=mismatches, typed=typed_len, total=total, progress=progress)
         self._update_metrics(m)
 
-        pos = min(correct_prefix, max(0, total))
+        pos = self._last_expected_idx
         line, col = self._index_to_line_col(target, pos)
         self.lbl_pos.setText(f"Pos: {pos}/{total} (L{line}:C{col})")
 
@@ -1208,7 +1333,7 @@ class MainWindow(QMainWindow):
         ed.setCursorPosition(line, col)
         ed.ensureCursorVisible()
 
-    # ---------------- Overlay / Indicators ----------------
+    # ---------------- Overlay / Indicators + Markers ----------------
     def _clear_indicators(self, ed: QsciScintilla, length: int):
         length = max(0, int(length))
         if length <= 0:
@@ -1223,6 +1348,31 @@ class MainWindow(QMainWindow):
         ed.SendScintilla(ed.SCI_SETINDICATORCURRENT, ind_id)
         ed.SendScintilla(ed.SCI_INDICATORFILLRANGE, start, length)
 
+    def _clear_markers(self, ed: QsciScintilla):
+        try:
+            ed.markerDeleteAll(self.MARK_EXPECT)
+            ed.markerDeleteAll(self.MARK_MISMATCH)
+        except Exception:
+            pass
+
+    def _update_markers(self, ed: QsciScintilla, expect_line: int, mismatch_line: Optional[int]):
+        try:
+            ed.markerDeleteAll(self.MARK_EXPECT)
+            ed.markerDeleteAll(self.MARK_MISMATCH)
+        except Exception:
+            pass
+
+        try:
+            ed.markerAdd(max(0, expect_line), self.MARK_EXPECT)
+        except Exception:
+            pass
+
+        if mismatch_line is not None:
+            try:
+                ed.markerAdd(max(0, mismatch_line), self.MARK_MISMATCH)
+            except Exception:
+                pass
+
     def _update_overlay_src(self, typed_text: str):
         target = self.target_text
         tlen = len(target)
@@ -1230,6 +1380,7 @@ class MainWindow(QMainWindow):
 
         self._clear_indicators(self.src, tlen)
         if tlen == 0:
+            self._clear_markers(self.src)
             return
 
         if plen > 0:
@@ -1242,17 +1393,21 @@ class MainWindow(QMainWindow):
                 self._fill_indicator(self.src, self.IND_CORRECT if is_ok else self.IND_WRONG, i, j - i)
                 i = j
 
-        correct_prefix = 0
-        for i in range(plen):
-            if typed_text[i] != target[i]:
-                break
-            correct_prefix += 1
-
-        cursor_pos = min(correct_prefix, max(0, tlen - 1))
+        cursor_pos = min(self._last_expected_idx, max(0, tlen - 1))
         self._fill_indicator(self.src, self.IND_CURSOR, cursor_pos, 1)
 
-        line, _col = self.src.lineIndexFromPosition(cursor_pos)
-        self.src.setFirstVisibleLine(max(0, line - 5))
+        line, col = self.src.lineIndexFromPosition(cursor_pos)
+        try:
+            self.src.setCursorPosition(line, col)
+            self.src.ensureCursorVisible()
+            self.src.setFirstVisibleLine(max(0, line - 5))
+        except Exception:
+            pass
+
+        mm_line = None
+        if self._last_first_mismatch_idx is not None:
+            mm_line, _ = self.src.lineIndexFromPosition(int(self._last_first_mismatch_idx))
+        self._update_markers(self.src, expect_line=line, mismatch_line=mm_line)
 
     def _update_overlay_inp(self, typed_text: str):
         target = self.target_text
@@ -1261,6 +1416,7 @@ class MainWindow(QMainWindow):
 
         self._clear_indicators(self.inp, max(ilen, 1))
         if ilen == 0:
+            self._clear_markers(self.inp)
             return
 
         plen = min(ilen, tlen)
@@ -1277,16 +1433,23 @@ class MainWindow(QMainWindow):
         if ilen > tlen:
             self._fill_indicator(self.inp, self.IND_WRONG, tlen, ilen - tlen)
 
-        fm = None
-        for i in range(min(ilen, tlen)):
-            if typed_text[i] != target[i]:
-                fm = i
-                break
-        if fm is None and ilen > tlen:
-            fm = tlen
-
-        cursor_pos = max(0, (min(fm, ilen - 1) if fm is not None else ilen - 1))
+        fm = self._last_first_mismatch_idx
+        cursor_pos = max(0, (min(int(fm), ilen - 1) if fm is not None else ilen - 1))
         self._fill_indicator(self.inp, self.IND_CURSOR, cursor_pos, 1)
+
+        try:
+            cur_line, _ = self.inp.getCursorPosition()
+        except Exception:
+            cur_line = 0
+
+        mm_line = None
+        if fm is not None:
+            try:
+                mm_line, _ = self.inp.lineIndexFromPosition(int(fm))
+            except Exception:
+                mm_line = None
+
+        self._update_markers(self.inp, expect_line=cur_line, mismatch_line=mm_line)
 
     # ---------------- Utilities ----------------
     @staticmethod
