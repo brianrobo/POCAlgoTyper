@@ -2,15 +2,16 @@
 """
 C++ Typing Trainer (PyQt5 + QScintilla)
 
-Version: 0.1.5  (2025-12-24)
+Version: 0.1.7  (2025-12-24)
 Versioning: MAJOR.MINOR.PATCH (SemVer)
 
-Release Notes (v0.1.5):
-- (New) Dark Theme 지원 (Light/Dark 전환 + 설정 유지)
-  - Qt 전역 팔레트(Fusion) + QScintilla/lexer 색상 동기화
-  - margin, caret line, selection, indicator 색상까지 적용
-- (Maintain) Preset reorder(Up/Down + Drag&Drop), Import/Export(Replace/Merge), Load .txt,
-            Strict Mode, Beep, overlay, paste-block, metrics 유지
+Release Notes (v0.1.7):
+- (Fix) QsciLexerCPP 에 setFontWeight()가 없어 발생한 AttributeError 해결
+  - 스타일별 QFont 복제 + lex.setFont(font, style) 방식으로 bold/italic 적용
+- (Improve) Dark 테마에서 IDE 느낌의 C++ 컬러링(VS Code Dark+ 근사) 유지
+- (Maintain) Presets(좌측 목록/선택/추가/삭제/이름변경/Up/Down/Drag reorder),
+            Import/Export(Replace/Merge), Load .txt, Strict Mode, Beep, overlay,
+            paste-block, metrics, auto-start 유지
 """
 
 import sys
@@ -411,8 +412,6 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._restore_ui_settings()
-
-        # Apply theme after UI built (affects palette + editors)
         self._apply_theme(self._get_theme())
 
         self._refresh_preset_list(select_name=self.pstore.data.get("last_selected"))
@@ -448,7 +447,6 @@ class MainWindow(QMainWindow):
         self.chk_strict = QCheckBox("Strict Mode")
         self.chk_beep = QCheckBox("Beep on Error")
 
-        # Theme selector
         self.cmb_theme = QComboBox()
         self.cmb_theme.addItems(["Light", "Dark"])
         self.cmb_theme.currentTextChanged.connect(self._on_theme_changed)
@@ -506,12 +504,10 @@ class MainWindow(QMainWindow):
 
         self.list_presets = QListWidget()
         self.list_presets.setSelectionMode(QAbstractItemView.SingleSelection)
-
         self.list_presets.setDragEnabled(True)
         self.list_presets.setAcceptDrops(True)
         self.list_presets.setDropIndicatorShown(True)
         self.list_presets.setDragDropMode(QAbstractItemView.InternalMove)
-
         self.list_presets.itemSelectionChanged.connect(self._on_preset_selected)
         pvl.addWidget(self.list_presets, stretch=1)
 
@@ -547,7 +543,7 @@ class MainWindow(QMainWindow):
 
         self.main_splitter.addWidget(self.preset_panel)
 
-        # Right: editors
+        # Right: Editors
         self.editor_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.addWidget(self.editor_splitter)
         self.main_splitter.setSizes([280, 1000])
@@ -563,7 +559,6 @@ class MainWindow(QMainWindow):
 
         self.inp.textChanged.connect(self._on_input_changed)
 
-        # Persist drag-drop reorder
         try:
             self.list_presets.model().rowsMoved.connect(self._on_preset_rows_moved)
         except Exception:
@@ -574,6 +569,9 @@ class MainWindow(QMainWindow):
         ed.setUtf8(True)
         ed.setFont(font)
         ed.setMarginsFont(font)
+
+        # store base font for lexer styling (bold/italic)
+        self._base_editor_font = QFont(font)
 
         ed.setMarginType(0, QsciScintilla.NumberMargin)
         ed.setMarginWidth(0, "00000")
@@ -615,8 +613,104 @@ class MainWindow(QMainWindow):
         self._save_theme(theme)
         self._apply_theme(theme)
 
+    def _set_lex_style(
+        self,
+        lex: QsciLexerCPP,
+        style: int,
+        fg: QColor | None = None,
+        bg: QColor | None = None,
+        bold: bool | None = None,
+        italic: bool | None = None,
+    ):
+        if fg is not None:
+            lex.setColor(fg, style)
+        if bg is not None:
+            lex.setPaper(bg, style)
+
+        # PyQt5-QScintilla: setFontWeight()가 없으므로 QFont를 복제하여 style별로 적용
+        if (bold is not None) or (italic is not None):
+            base = QFont(getattr(self, "_base_editor_font", QFont("Consolas", 11)))
+            if bold is not None:
+                base.setBold(bool(bold))
+            if italic is not None:
+                base.setItalic(bool(italic))
+            lex.setFont(base, style)
+
+    def _apply_cpp_lexer_colors(self, lex: QsciLexerCPP, theme: str, paper: QColor, ink: QColor):
+        if lex is None:
+            return
+
+        try:
+            for s in range(0, 128):
+                lex.setPaper(paper, s)
+        except Exception:
+            pass
+
+        lex.setDefaultPaper(paper)
+        lex.setDefaultColor(ink)
+
+        if theme == "Dark":
+            c_comment = QColor(106, 153, 85)      # #6A9955
+            c_keyword = QColor(86, 156, 214)      # #569CD6
+            c_keyword2 = QColor(197, 134, 192)    # #C586C0
+            c_string = QColor(206, 145, 120)      # #CE9178
+            c_number = QColor(181, 206, 168)      # #B5CEA8
+            c_preproc = QColor(155, 155, 155)
+            c_identifier = ink
+            c_class = QColor(78, 201, 176)        # #4EC9B0
+            c_regex = QColor(215, 186, 125)       # #D7BA7D
+            c_bad = QColor(255, 100, 100)
+            c_doc_kw = QColor(86, 156, 214)
+        else:
+            c_comment = QColor(0, 128, 0)
+            c_keyword = QColor(0, 0, 180)
+            c_keyword2 = QColor(128, 0, 128)
+            c_string = QColor(163, 21, 21)
+            c_number = QColor(9, 134, 88)
+            c_preproc = QColor(90, 90, 90)
+            c_identifier = ink
+            c_class = QColor(43, 145, 175)
+            c_regex = QColor(128, 128, 0)
+            c_bad = QColor(200, 0, 0)
+            c_doc_kw = QColor(0, 0, 180)
+
+        S = QsciLexerCPP
+
+        self._set_lex_style(lex, S.Default, fg=ink, bold=False)
+        self._set_lex_style(lex, S.Identifier, fg=c_identifier)
+        self._set_lex_style(lex, S.Operator, fg=ink)
+
+        self._set_lex_style(lex, S.Comment, fg=c_comment, italic=True)
+        self._set_lex_style(lex, S.CommentLine, fg=c_comment, italic=True)
+        self._set_lex_style(lex, S.CommentDoc, fg=c_comment, italic=True)
+        self._set_lex_style(lex, S.CommentLineDoc, fg=c_comment, italic=True)
+
+        self._set_lex_style(lex, S.Number, fg=c_number)
+
+        self._set_lex_style(lex, S.SingleQuotedString, fg=c_string)
+        self._set_lex_style(lex, S.DoubleQuotedString, fg=c_string)
+        self._set_lex_style(lex, S.VerbatimString, fg=c_string)
+        self._set_lex_style(lex, S.RawString, fg=c_string)
+        self._set_lex_style(lex, S.TripleQuotedVerbatimString, fg=c_string)
+        self._set_lex_style(lex, S.HashQuotedString, fg=c_string)
+
+        self._set_lex_style(lex, S.Keyword, fg=c_keyword, bold=True)
+        self._set_lex_style(lex, S.KeywordSet2, fg=c_keyword2, bold=True)
+
+        self._set_lex_style(lex, S.PreProcessor, fg=c_preproc)
+        self._set_lex_style(lex, S.UUID, fg=c_class)
+        self._set_lex_style(lex, S.Regex, fg=c_regex)
+        self._set_lex_style(lex, S.UnclosedString, fg=c_bad, bold=True)
+
+        self._set_lex_style(lex, S.CommentDocKeyword, fg=c_doc_kw, bold=True)
+        self._set_lex_style(lex, S.CommentDocKeywordError, fg=c_bad, bold=True)
+
+        try:
+            self._set_lex_style(lex, S.GlobalClass, fg=c_class, bold=True)
+        except Exception:
+            pass
+
     def _apply_theme(self, theme: str):
-        # Keep combobox in sync (avoid recursion)
         if self.cmb_theme.currentText() != theme:
             self.cmb_theme.blockSignals(True)
             try:
@@ -628,7 +722,6 @@ class MainWindow(QMainWindow):
         if not app:
             return
 
-        # Use Fusion for consistent palette behavior
         try:
             app.setStyle("Fusion")
         except Exception:
@@ -650,8 +743,9 @@ class MainWindow(QMainWindow):
             app.setPalette(pal)
 
             self._apply_scintilla_theme(
-                paper=QColor(25, 25, 25),
-                ink=QColor(220, 220, 220),
+                theme="Dark",
+                paper=QColor(30, 30, 30),
+                ink=QColor(212, 212, 212),
                 margin_bg=QColor(45, 45, 45),
                 margin_fg=QColor(180, 180, 180),
                 caretline_bg=QColor(40, 40, 40),
@@ -664,6 +758,7 @@ class MainWindow(QMainWindow):
         else:
             app.setPalette(app.style().standardPalette())
             self._apply_scintilla_theme(
+                theme="Light",
                 paper=QColor(255, 255, 255),
                 ink=QColor(0, 0, 0),
                 margin_bg=QColor(235, 235, 235),
@@ -678,6 +773,7 @@ class MainWindow(QMainWindow):
 
     def _apply_scintilla_theme(
         self,
+        theme: str,
         paper: QColor,
         ink: QColor,
         margin_bg: QColor,
@@ -693,20 +789,16 @@ class MainWindow(QMainWindow):
             if ed is None:
                 continue
 
-            # Editor base colors
             ed.setPaper(paper)
             ed.setColor(ink)
             ed.setCaretLineBackgroundColor(caretline_bg)
 
-            # Margin
             ed.setMarginsBackgroundColor(margin_bg)
             ed.setMarginsForegroundColor(margin_fg)
 
-            # Selection
             ed.setSelectionBackgroundColor(selection_bg)
             ed.setSelectionForegroundColor(selection_fg)
 
-            # Indicators: improve visibility on dark background
             try:
                 ed.indicatorSetForegroundColor(indic_correct, self.IND_CORRECT)
                 ed.indicatorSetForegroundColor(indic_wrong, self.IND_WRONG)
@@ -714,19 +806,10 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-            # Lexer colors (apply to many styles to avoid mixed defaults)
             lex = ed.lexer()
-            if lex is not None:
-                try:
-                    lex.setDefaultPaper(paper)
-                    lex.setDefaultColor(ink)
-                    for style in range(0, 128):
-                        lex.setPaper(paper, style)
-                        lex.setColor(ink, style)
-                except Exception:
-                    pass
+            if isinstance(lex, QsciLexerCPP):
+                self._apply_cpp_lexer_colors(lex, theme=theme, paper=paper, ink=ink)
 
-            # Force redraw
             try:
                 ed.repaint()
             except Exception:
