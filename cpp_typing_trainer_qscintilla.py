@@ -2,17 +2,17 @@
 """
 C++ Typing Trainer (PyQt5 + QScintilla)
 
-Version: 0.1.10  (2025-12-29)
+Version: 0.2.0  (2025-12-29)
 Versioning: MAJOR.MINOR.PATCH (SemVer)
 
-Release Notes (v0.1.10):
-- (Add) Window title에 Release Version + 현재 타겟 상태(Preset/Loaded) 표시
-  - 예: "C++ Typing Trainer v0.1.10 — Preset: Default"
-  - 예: "C++ Typing Trainer v0.1.10 — Loaded: sample.txt"
-- (Maintain) v0.1.9 기능 유지
-  - Marker symbol fallback (방법 B)
-  - Dark/Light + C++ Lexer coloring
-  - Presets(좌측 목록/추가/삭제/이름변경/정렬/드래그), Import/Export, Load .txt
+Release Notes (v0.2.0):
+- (Add) Preset 텍스트를 파일 없이도 등록/수정 가능
+  - "Paste/Add": 붙여넣기(또는 직접 입력)로 새 Preset 생성
+  - "Edit": 선택 Preset의 텍스트를 간단 편집(QPlainTextEdit 기반, 가볍고 빠름)
+- (Maintain) v0.1.9 유지
+  - Marker symbol 상수 미존재 환경 fallback(방법 B)
+  - Dark/Light 테마 + C++ 컬러링
+  - Presets 관리(좌측 목록/추가/삭제/이름변경/정렬/드래그), Import/Export, Load .txt
   - Strict Mode, Beep, overlay, paste-block, metrics, auto-start
 """
 
@@ -43,12 +43,11 @@ from PyQt5.QtWidgets import (
     QInputDialog,
     QAbstractItemView,
     QComboBox,
+    QDialog,
+    QPlainTextEdit,
 )
 
 from PyQt5.Qsci import QsciScintilla, QsciLexerCPP
-
-
-APP_VERSION = "0.1.10"
 
 
 DEFAULT_CPP = r"""#include <iostream>
@@ -335,6 +334,34 @@ class PresetStore:
         self.save()
 
 
+# ---------------- Lightweight preset editor dialog ----------------
+class PresetTextDialog(QDialog):
+    def __init__(self, parent=None, title="Preset Text", initial_text=""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(900, 650)
+
+        lay = QVBoxLayout(self)
+
+        self.editor = QPlainTextEdit()
+        self.editor.setPlainText(initial_text or "")
+        self.editor.setFont(QFont("Consolas", 11))
+        lay.addWidget(self.editor, stretch=1)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(ok_btn)
+        btns.addWidget(cancel_btn)
+        lay.addLayout(btns)
+
+    def get_text(self) -> str:
+        return self.editor.toPlainText()
+
+
 @dataclass
 class Metrics:
     elapsed_s: float = 0.0
@@ -411,6 +438,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.setWindowTitle("C++ Typing Trainer (PyQt5 + QScintilla)")
         self.resize(1280, 780)
 
         self.settings = QSettings("PoC_Algo_Typer", "CppTypingTrainer")
@@ -418,7 +446,6 @@ class MainWindow(QMainWindow):
 
         self.target_text = DEFAULT_CPP.replace("\r\n", "\n")
         self.target_name = "Default"
-        self._target_source = "Preset"  # "Preset" | "Loaded"
 
         self.start_time = None
         self.running = False
@@ -449,12 +476,6 @@ class MainWindow(QMainWindow):
             self._select_preset_in_list("Default")
 
         self._reset()
-
-    # ---------------- Title ----------------
-    def _update_window_title(self):
-        src = self._target_source if self._target_source in ("Preset", "Loaded") else "Preset"
-        name = self.target_name or "Untitled"
-        self.setWindowTitle(f"C++ Typing Trainer v{APP_VERSION} — {src}: {name}")
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -551,12 +572,20 @@ class MainWindow(QMainWindow):
 
         cb = QHBoxLayout()
         self.btn_p_add = QPushButton("Add")
+        self.btn_p_paste = QPushButton("Paste/Add")
+        self.btn_p_edit = QPushButton("Edit")
         self.btn_p_rename = QPushButton("Rename")
         self.btn_p_del = QPushButton("Delete")
+
         self.btn_p_add.clicked.connect(self._preset_add_current)
+        self.btn_p_paste.clicked.connect(self._preset_paste_add)
+        self.btn_p_edit.clicked.connect(self._preset_edit_text)
         self.btn_p_rename.clicked.connect(self._preset_rename)
         self.btn_p_del.clicked.connect(self._preset_delete)
+
         cb.addWidget(self.btn_p_add)
+        cb.addWidget(self.btn_p_paste)
+        cb.addWidget(self.btn_p_edit)
         cb.addWidget(self.btn_p_rename)
         cb.addWidget(self.btn_p_del)
         pvl.addLayout(cb)
@@ -1058,6 +1087,63 @@ class MainWindow(QMainWindow):
         self.pstore.set_last_selected(name)
         self._refresh_preset_list(select_name=name)
 
+    def _preset_paste_add(self):
+        name, ok = QInputDialog.getText(self, "Paste/Add Preset", "Preset name:", text="NewPreset")
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            return
+
+        base = name
+        idx = 2
+        while self.pstore.get_by_name(name) is not None:
+            name = f"{base} ({idx})"
+            idx += 1
+
+        dlg = PresetTextDialog(self, title=f"Paste code for '{name}'", initial_text="")
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        text = (dlg.get_text() or "").replace("\r\n", "\n")
+        if not text.strip():
+            QMessageBox.information(self, "Empty", "Text is empty. Nothing to add.")
+            return
+
+        self.pstore.upsert(name, text)
+        self.pstore.set_last_selected(name)
+        self._refresh_preset_list(select_name=name)
+
+        p = self.pstore.get_by_name(name)
+        if p:
+            self._apply_target(p.get("text", ""), name=name, from_preset=True)
+
+    def _preset_edit_text(self):
+        name = self._current_preset_name()
+        if not name:
+            QMessageBox.information(self, "Edit", "Select a preset to edit.")
+            return
+
+        p = self.pstore.get_by_name(name)
+        if not p:
+            return
+
+        old_text = (p.get("text", "") or "").replace("\r\n", "\n")
+        dlg = PresetTextDialog(self, title=f"Edit preset '{name}'", initial_text=old_text)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        new_text = (dlg.get_text() or "").replace("\r\n", "\n")
+        if not new_text.strip():
+            QMessageBox.information(self, "Empty", "Text is empty. Edit cancelled.")
+            return
+
+        self.pstore.upsert(name, new_text)
+        self.pstore.set_last_selected(name)
+
+        self._apply_target(new_text, name=name, from_preset=True)
+        self._select_preset_in_list(name)
+
     def _preset_rename(self):
         old = self._current_preset_name()
         if not old:
@@ -1076,7 +1162,6 @@ class MainWindow(QMainWindow):
         if self.target_name == old:
             self.target_name = new
             self.lbl_target.setText(f"Target: {self.target_name} (Preset)  |  {len(self.target_text)} chars")
-            self._update_window_title()
 
     def _preset_delete(self):
         name = self._current_preset_name()
@@ -1095,9 +1180,7 @@ class MainWindow(QMainWindow):
                 self._apply_target(p.get("text", ""), name=select, from_preset=True)
 
     def _preset_export(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Presets", "presets_export.json", "JSON Files (*.json);;All Files (*.*)"
-        )
+        path, _ = QFileDialog.getSaveFileName(self, "Export Presets", "presets_export.json", "JSON Files (*.json);;All Files (*.*)")
         if not path:
             return
         try:
@@ -1155,12 +1238,8 @@ class MainWindow(QMainWindow):
     def _apply_target(self, text: str, name: str, from_preset: bool = False):
         self.target_text = (text or "").replace("\r\n", "\n")
         self.target_name = name or ("Preset" if from_preset else "Loaded")
-        self._target_source = "Preset" if from_preset else "Loaded"
-
         suffix = " (Preset)" if from_preset else " (Loaded)"
         self.lbl_target.setText(f"Target: {self.target_name}{suffix}  |  {len(self.target_text)} chars")
-
-        self._update_window_title()
 
         self._ignore_textchange = True
         try:
