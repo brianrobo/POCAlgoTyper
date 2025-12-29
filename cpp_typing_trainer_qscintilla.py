@@ -2,18 +2,16 @@
 """
 C++ Typing Trainer (PyQt5 + QScintilla)
 
-Version: 0.2.0  (2025-12-29)
+Version: 0.2.1  (2025-12-29)
 Versioning: MAJOR.MINOR.PATCH (SemVer)
 
-Release Notes (v0.2.0):
-- (Add) Preset 텍스트를 파일 없이도 등록/수정 가능
-  - "Paste/Add": 붙여넣기(또는 직접 입력)로 새 Preset 생성
-  - "Edit": 선택 Preset의 텍스트를 간단 편집(QPlainTextEdit 기반, 가볍고 빠름)
-- (Maintain) v0.1.9 유지
-  - Marker symbol 상수 미존재 환경 fallback(방법 B)
-  - Dark/Light 테마 + C++ 컬러링
-  - Presets 관리(좌측 목록/추가/삭제/이름변경/정렬/드래그), Import/Export, Load .txt
-  - Strict Mode, Beep, overlay, paste-block, metrics, auto-start
+Release Notes (v0.2.1):
+- (Change) 첫 실행(설정값 없음)부터 Dark 테마 기본 적용
+- (Improve) Dark에 맞춘 위젯/리스트/다이얼로그의 가벼운 QSS 적용(과도한 스타일링 없이 일관성 확보)
+- (Maintain) v0.2.0 기능 유지
+  - Preset: Paste/Add(붙여넣기/직접입력), Edit(간단 편집), Import/Export, Drag reorder, Up/Down
+  - QScintilla: C++ 컬러링, brace highlight, overlay, marker fallback(방법 B)
+  - Strict Mode, Beep, metrics, auto-start, paste-block
 """
 
 import sys
@@ -46,6 +44,7 @@ from PyQt5.QtWidgets import (
     QDialog,
     QPlainTextEdit,
 )
+
 
 from PyQt5.Qsci import QsciScintilla, QsciLexerCPP
 
@@ -462,6 +461,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._restore_ui_settings()
+
+        # Theme must be applied after UI restore.
         self._apply_theme(self._get_theme())
 
         self._refresh_preset_list(select_name=self.pstore.data.get("last_selected"))
@@ -476,6 +477,50 @@ class MainWindow(QMainWindow):
             self._select_preset_in_list("Default")
 
         self._reset()
+
+    # ---------------- Minimal Dark QSS ----------------
+    @staticmethod
+    def _qss_dark() -> str:
+        # "가볍고 빠르게" 목적: 필요한 위젯만 최소 적용
+        return """
+        QWidget { background: #1e1e1e; color: #dcdcdc; }
+        QMainWindow::separator { background: #2b2b2b; }
+        QLabel { color: #dcdcdc; }
+        QPushButton {
+            background: #2d2d2d;
+            border: 1px solid #3a3a3a;
+            padding: 6px 10px;
+            border-radius: 6px;
+        }
+        QPushButton:hover { border: 1px solid #4a4a4a; }
+        QPushButton:pressed { background: #252525; }
+        QCheckBox { spacing: 8px; }
+        QCheckBox::indicator { width: 16px; height: 16px; }
+        QComboBox {
+            background: #2d2d2d;
+            border: 1px solid #3a3a3a;
+            padding: 4px 8px;
+            border-radius: 6px;
+        }
+        QComboBox QAbstractItemView {
+            background: #2d2d2d;
+            color: #dcdcdc;
+            selection-background-color: #3d5a7a;
+        }
+        QListWidget {
+            background: #1b1b1b;
+            border: 1px solid #333333;
+        }
+        QListWidget::item { padding: 6px 8px; }
+        QListWidget::item:selected { background: #2f4f6f; }
+        QPlainTextEdit {
+            background: #1b1b1b;
+            border: 1px solid #333333;
+            selection-background-color: #2f4f6f;
+        }
+        QSplitter::handle { background: #2b2b2b; }
+        QMessageBox { background: #1e1e1e; }
+        """
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -604,7 +649,7 @@ class MainWindow(QMainWindow):
         # Right: Editors
         self.editor_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.addWidget(self.editor_splitter)
-        self.main_splitter.setSizes([280, 1000])
+        self.main_splitter.setSizes([320, 960])
 
         self.src = QsciScintilla()
         self._setup_editor(self.src, readonly=True)
@@ -687,14 +732,18 @@ class MainWindow(QMainWindow):
 
     # ---------------- Theme helpers ----------------
     def _get_theme(self) -> str:
-        t = self.settings.value("theme", "Light")
-        return t if t in ("Light", "Dark") else "Light"
+        # 첫 실행부터 Dark: 설정값이 없으면 Dark로 간주
+        t = self.settings.value("theme", None)
+        if t is None or str(t).strip() == "":
+            return "Dark"
+        t = str(t)
+        return t if t in ("Light", "Dark") else "Dark"
 
     def _save_theme(self, theme: str):
         self.settings.setValue("theme", theme)
 
     def _on_theme_changed(self, theme: str):
-        theme = theme if theme in ("Light", "Dark") else "Light"
+        theme = theme if theme in ("Light", "Dark") else "Dark"
         self._save_theme(theme)
         self._apply_theme(theme)
 
@@ -833,6 +882,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # reset styles first to avoid stacking
+        app.setStyleSheet("")
+
         if theme == "Dark":
             pal = QPalette()
             pal.setColor(QPalette.Window, QColor(30, 30, 30))
@@ -847,6 +899,7 @@ class MainWindow(QMainWindow):
             pal.setColor(QPalette.Highlight, QColor(70, 110, 160))
             pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
             app.setPalette(pal)
+            app.setStyleSheet(self._qss_dark())
 
             self._apply_scintilla_theme(
                 theme="Dark",
@@ -870,6 +923,7 @@ class MainWindow(QMainWindow):
             )
         else:
             app.setPalette(app.style().standardPalette())
+            app.setStyleSheet("")
             self._apply_scintilla_theme(
                 theme="Light",
                 paper=QColor(255, 255, 255),
