@@ -2,19 +2,18 @@
 """
 C++ Typing Trainer (PyQt5 + QScintilla)
 
-Version: 0.1.9  (2025-12-24)
+Version: 0.1.10  (2025-12-29)
 Versioning: MAJOR.MINOR.PATCH (SemVer)
 
-Release Notes (v0.1.9):
-- (Fix) Marker symbol 상수(ShortArrow/RightArrow 등) 미존재 환경에서의 AttributeError 해결
-  - markerDefine 시 사용 가능한 심볼을 hasattr()로 탐색하여 자동 fallback (방법 B)
-- (Maintain) v0.1.8의 IDE 감성 기능 유지
-  - Bracket matching 색상/굵기 커스터마이즈
-  - 기대 위치(=expected) 라인 강조 (Source caret line + marker)
-  - 첫 mismatch 라인 gutter marker (Source/Input)
-  - Dark/Light 테마 + C++ 컬러링
-  - Presets 관리(좌측 목록/추가/삭제/이름변경/정렬/드래그), Import/Export, Load .txt,
-    Strict Mode, Beep, overlay, paste-block, metrics, auto-start
+Release Notes (v0.1.10):
+- (Add) Window title에 Release Version + 현재 타겟 상태(Preset/Loaded) 표시
+  - 예: "C++ Typing Trainer v0.1.10 — Preset: Default"
+  - 예: "C++ Typing Trainer v0.1.10 — Loaded: sample.txt"
+- (Maintain) v0.1.9 기능 유지
+  - Marker symbol fallback (방법 B)
+  - Dark/Light + C++ Lexer coloring
+  - Presets(좌측 목록/추가/삭제/이름변경/정렬/드래그), Import/Export, Load .txt
+  - Strict Mode, Beep, overlay, paste-block, metrics, auto-start
 """
 
 import sys
@@ -47,6 +46,9 @@ from PyQt5.QtWidgets import (
 )
 
 from PyQt5.Qsci import QsciScintilla, QsciLexerCPP
+
+
+APP_VERSION = "0.1.10"
 
 
 DEFAULT_CPP = r"""#include <iostream>
@@ -409,7 +411,6 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("C++ Typing Trainer (PyQt5 + QScintilla)")
         self.resize(1280, 780)
 
         self.settings = QSettings("PoC_Algo_Typer", "CppTypingTrainer")
@@ -417,6 +418,7 @@ class MainWindow(QMainWindow):
 
         self.target_text = DEFAULT_CPP.replace("\r\n", "\n")
         self.target_name = "Default"
+        self._target_source = "Preset"  # "Preset" | "Loaded"
 
         self.start_time = None
         self.running = False
@@ -447,6 +449,12 @@ class MainWindow(QMainWindow):
             self._select_preset_in_list("Default")
 
         self._reset()
+
+    # ---------------- Title ----------------
+    def _update_window_title(self):
+        src = self._target_source if self._target_source in ("Preset", "Loaded") else "Preset"
+        name = self.target_name or "Untitled"
+        self.setWindowTitle(f"C++ Typing Trainer v{APP_VERSION} — {src}: {name}")
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -1068,6 +1076,7 @@ class MainWindow(QMainWindow):
         if self.target_name == old:
             self.target_name = new
             self.lbl_target.setText(f"Target: {self.target_name} (Preset)  |  {len(self.target_text)} chars")
+            self._update_window_title()
 
     def _preset_delete(self):
         name = self._current_preset_name()
@@ -1086,7 +1095,9 @@ class MainWindow(QMainWindow):
                 self._apply_target(p.get("text", ""), name=select, from_preset=True)
 
     def _preset_export(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export Presets", "presets_export.json", "JSON Files (*.json);;All Files (*.*)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Presets", "presets_export.json", "JSON Files (*.json);;All Files (*.*)"
+        )
         if not path:
             return
         try:
@@ -1144,8 +1155,12 @@ class MainWindow(QMainWindow):
     def _apply_target(self, text: str, name: str, from_preset: bool = False):
         self.target_text = (text or "").replace("\r\n", "\n")
         self.target_name = name or ("Preset" if from_preset else "Loaded")
+        self._target_source = "Preset" if from_preset else "Loaded"
+
         suffix = " (Preset)" if from_preset else " (Loaded)"
         self.lbl_target.setText(f"Target: {self.target_name}{suffix}  |  {len(self.target_text)} chars")
+
+        self._update_window_title()
 
         self._ignore_textchange = True
         try:
